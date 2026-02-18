@@ -30,3 +30,7 @@ config/mcp.json
 
 # Logs
 cli/mcp.log
+
+# Demo source (keep generated outputs)
+demo.tape
+demo.webm

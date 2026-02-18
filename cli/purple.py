@@ -571,11 +571,33 @@ async def one_shot(chat: OllamaChat, prompt: str):
 # Main
 # ---------------------------------------------------------------------------
 
+async def _check_ollama() -> bool:
+    """Verify Ollama is reachable before starting. Returns True if healthy."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_URL}/api/version")
+            resp.raise_for_status()
+            version = resp.json().get("version", "unknown")
+            print(f"{C_DIM}[ollama] Connected -- v{version}{C_RESET}")
+            return True
+    except httpx.ConnectError:
+        print(f"{C_RED}[error] Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
+        print(f"{C_DIM}  Start it with: ollama serve{C_RESET}")
+        return False
+    except Exception as e:
+        print(f"{C_YELLOW}[warn] Ollama health check failed: {e}{C_RESET}")
+        return True  # Proceed anyway -- might still work
+
+
 async def main():
     tool_manager = MCPToolManager()
     chat = None
 
     try:
+        # Verify Ollama is reachable
+        if not await _check_ollama():
+            return
+
         # Connect to MCP servers
         await tool_manager.connect()
 

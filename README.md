@@ -2,6 +2,8 @@
 
 A local AI agent that connects Ollama to MCP tools. ~1200 lines of Python across 3 files. No frameworks, no OpenAI shims, no abstractions between you and the model.
 
+![Purple CLI demo](demo.gif)
+
 ## What It Does
 
 - Talks to Ollama via native `/api/chat` (not the OpenAI-compatible `/v1` endpoint)
@@ -97,19 +99,18 @@ The CLI is the orchestrator. It sends your message to Ollama with tool definitio
 
 ## Comparison
 
-| | Purple CLI | ollmcp | mcp-client-cli |
+| | Purple CLI | [ollmcp](https://github.com/jonigl/mcp-client-for-ollama) | [mcp-client-cli](https://github.com/adhikasp/mcp-client-cli) |
 |---|---|---|---|
-| Ollama integration | Native `/api/chat` | Ollama SDK | LangChain |
-| MCP transport | STDIO (FastMCP) | STDIO | STDIO |
+| Ollama integration | Native `/api/chat` | Ollama SDK | Multi-provider (OpenAI, Groq, llama.cpp) |
+| MCP transport | STDIO | STDIO, SSE, Streamable HTTP | STDIO, HTTP |
 | Tool call fallback | XML parsing for broken JSON | None | None |
-| Streaming | Yes | Yes | No |
-| Context management | Sliding window trim | None | None |
+| Streaming | Yes | Yes | Yes |
+| Context management | Sliding window trim | Keep Tokens + history export | Token tracking + session persistence |
+| Bundled tools | 10 tools (memory, PDF, Excel, Word, PPTX) | None (bring your own) | None (bring your own) |
 | Config format | JSON | TOML | JSON |
-| Lines of code | ~1200 | ~800 | ~400 |
-| Document tools | Included (PDF, Excel, Word, PPTX) | None | None |
-| Memory | Included (SQLite) | None | None |
+| Codebase | ~1200 lines, 3 files | Larger, full TUI | Smaller, multi-LLM focus |
 
-These are solid projects. Purple's angle: it ships with useful tools, handles the XML fallback that open-weight models need, and uses Ollama's native API instead of the lossy OpenAI translation layer.
+These are mature, actively developed projects with larger communities. Purple's angle is different: it ships with useful tools out of the box, handles the XML fallback that open-weight models need, and keeps the entire codebase small enough to read in one sitting. If you want a full-featured TUI, use ollmcp. If you want multi-provider support, use mcp-client-cli. If you want something you can understand and hack on in an afternoon, use Purple.
 
 ## Requirements
 

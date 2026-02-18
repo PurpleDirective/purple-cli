@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+
+# Data (never commit)
+memory/*.db
+memory/*.db-wal
+memory/*.db-shm
+*.db
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Personal config (not committed)
+identity/identity.md
+
+# Secrets
+.env
+secrets/
+credentials/
+
+# Local config (personal paths -- use mcp.example.json as template)
+config/mcp.json
+
+# Logs
+cli/mcp.log

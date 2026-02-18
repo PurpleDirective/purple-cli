@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "purple-cli"
+version = "0.1.0"
+description = "Local AI agent with native Ollama + MCP tool calling"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "PurpleDirective" },
+]
+
+dependencies = [
+    "fastmcp>=2.14.5,<3",
+    "httpx>=0.28.1",
+    "pdfplumber>=0.11.9",
+    "openpyxl>=3.1.5",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+]
+
+[project.scripts]
+purple = "cli.purple:main_sync"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cli*"]

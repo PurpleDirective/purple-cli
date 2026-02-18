@@ -1,0 +1,8 @@
+# Purple CLI dependencies
+# Pin fastmcp<3 to avoid breaking changes when FastMCP 3.0 ships
+fastmcp>=2.14.5,<3
+httpx>=0.28.1
+pdfplumber>=0.11.9
+openpyxl>=3.1.5
+python-docx>=1.2.0
+python-pptx>=1.0.2

@@ -47,8 +47,11 @@ def get_db() -> sqlite3.Connection:
 
 
 def _format_row(row: sqlite3.Row, truncate: int = 200) -> str:
-    tags = json.loads(row["tags"])
-    tag_str = f" [{', '.join(tags)}]" if tags else ""
+    try:
+        tags = json.loads(row["tags"])
+        tag_str = f" [{', '.join(str(t) for t in tags)}]" if isinstance(tags, list) and tags else ""
+    except (json.JSONDecodeError, TypeError):
+        tag_str = ""
     return f"#{row['id']} [{row['type']}]{tag_str} {row['content'][:truncate]} ({row['updated_at'][:10]})"
 
 
@@ -73,8 +76,10 @@ def _store_memory(content: str, type: str, tags: list[str] | None = None) -> str
 def _recall_memories(query: str, type: str | None = None, limit: int = 20) -> str:
     conn = get_db()
     try:
-        params: list = [f"%{query}%"]
-        sql = "SELECT * FROM memories WHERE content LIKE ?"
+        # Escape SQL LIKE wildcards in user input
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params: list = [f"%{escaped}%"]
+        sql = "SELECT * FROM memories WHERE content LIKE ? ESCAPE '\\'"
         if type:
             sql += " AND type = ?"
             params.append(type)

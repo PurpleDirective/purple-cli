@@ -325,6 +325,14 @@ class OllamaChat:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "unknown")
                 tool_args = func.get("arguments", {})
+                # Some models return arguments as a JSON string instead of dict
+                if isinstance(tool_args, str):
+                    try:
+                        tool_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
 
                 # Print tool call info
                 args_preview = json.dumps(tool_args, ensure_ascii=False)

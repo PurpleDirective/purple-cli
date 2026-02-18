@@ -26,6 +26,11 @@ SUBFOLDERS = {
 }
 
 
+def _sanitize_filename(filename: str) -> str:
+    """Strip path separators from filenames to prevent directory traversal."""
+    return Path(filename).name
+
+
 def _validate_path(path: Path, operation: str) -> str | None:
     """Check that a resolved path falls under PERMITTED_ROOTS.
     Returns None if valid, or an error string if the path is outside allowed roots."""
@@ -106,6 +111,9 @@ def read_excel(
     from openpyxl import load_workbook
 
     path = Path(file_path).expanduser()
+    err = _validate_path(path, "read_excel")
+    if err:
+        return err
     if not path.exists():
         return f"Error: file not found: {path}"
 
@@ -143,6 +151,9 @@ def read_pdf(
     import pdfplumber
 
     path = Path(file_path).expanduser()
+    err = _validate_path(path, "read_pdf")
+    if err:
+        return err
     if not path.exists():
         return f"Error: file not found: {path}"
     if not path.suffix.lower() == ".pdf":
@@ -254,6 +265,7 @@ def create_excel(
             )
             ws.column_dimensions[get_column_letter(col)].width = min(max_len + 4, 50)
 
+    filename = _sanitize_filename(filename)
     if not filename.endswith(".xlsx"):
         filename += ".xlsx"
 
@@ -332,6 +344,7 @@ def create_word(
         elif block_type == "page_break":
             doc.add_page_break()
 
+    filename = _sanitize_filename(filename)
     if not filename.endswith(".docx"):
         filename += ".docx"
 
@@ -404,6 +417,7 @@ def create_powerpoint(
                 txBox = sl.shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1))
                 txBox.text_frame.text = s.get("title", "")
 
+    filename = _sanitize_filename(filename)
     if not filename.endswith(".pptx"):
         filename += ".pptx"
 

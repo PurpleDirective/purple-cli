@@ -35,27 +35,69 @@ Ships with 2 MCP servers:
 
 Both servers enforce path validation -- file operations are restricted to the home directory and `/tmp`.
 
+## Prerequisites
+
+- **Python 3.11+** -- check with `python3 --version`
+- **[Ollama](https://ollama.com)** -- install and start with `ollama serve`
+- **A tool-calling model** -- e.g. `ollama pull qwen3-coder:30b` (or any model that supports function calling)
+
 ## Quick Start
+
+### One-command setup
 
 ```bash
 git clone https://github.com/PurpleDirective/purple-cli.git ~/.purple
 cd ~/.purple
-pip install -r requirements.txt
+bash setup.sh
+source venv/bin/activate
 python cli/purple.py
 ```
 
-You need Ollama running with a model that supports tool calling. Create a model with the included Modelfile, or point to your own:
+### Manual setup
 
 ```bash
+# Clone
+git clone https://github.com/PurpleDirective/purple-cli.git ~/.purple
+cd ~/.purple
+
+# Create virtual environment and install dependencies
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Set up config files
+cp config/mcp.example.json config/mcp.json
+cp identity/identity.example.md identity/identity.md
+
+# Create the default model (or use your own -- see below)
 ollama create purple -f config/Modelfile
+
+# Run
 python cli/purple.py
 ```
 
-Or use any tool-calling model directly:
+> **Note:** The project lives at `~/.purple` (a hidden directory). Use `cd ~/.purple` to access it after cloning.
+
+Or skip the custom model and use any tool-calling model directly:
 
 ```bash
 OLLAMA_MODEL=qwen3-coder:30b python cli/purple.py "summarize this PDF"
 ```
+
+## How Memory Works
+
+Memories are stored in a SQLite database at `~/.purple/memory/purple.db`. The database is created automatically on first use.
+
+- Memories persist across sessions -- close Purple, reopen it, and your memories are still there
+- Each memory has a type (`fact`, `preference`, `experience`, `correction`) and optional tags
+- The database uses WAL mode for safe concurrent access
+- File permissions are set to owner-only (chmod 600) automatically
+- Search uses keyword matching (`recall_memories "search term"`)
+- The database is excluded from git (in `.gitignore`) -- your memories stay on your machine
+
+To back up your memories: `cp ~/.purple/memory/purple.db ~/.purple/memory/purple.db.backup`
+
+To start fresh: delete `~/.purple/memory/purple.db` and it will be recreated on next run.
 
 ## Architecture
 
@@ -73,22 +115,28 @@ The CLI is the orchestrator. It sends your message to Ollama with tool definitio
 
 ## Configuration
 
-**`config/mcp.json`** -- Declares MCP servers. Each entry has a command array and an enabled flag:
+**`config/mcp.json`** -- Declares MCP servers. Each entry has a command array and an enabled flag. Created from `config/mcp.example.json` during setup (or auto-created on first run):
 
 ```json
 {
   "servers": {
     "purple-memory": {
-      "command": ["python", "memory/server.py"],
+      "command": ["python3", "memory/server.py"],
       "enabled": true
     }
   }
 }
 ```
 
+Server commands run from the `~/.purple` directory. If you installed into a virtual environment, update the commands to use your venv's Python:
+
+```json
+"command": ["/home/you/.purple/venv/bin/python3", "memory/server.py"]
+```
+
 **`config/Modelfile`** -- Ollama model definition. Sets context window, temperature, and a system prompt with tool-use rules.
 
-**`identity/identity.md`** -- System prompt loaded at startup. This is your model's personality. Write whatever you want here.
+**`identity/identity.md`** -- System prompt loaded at startup. This is your model's personality. Write whatever you want here. Created from `identity/identity.example.md` during setup (or auto-created on first run).
 
 ## Environment Variables
 
@@ -112,6 +160,20 @@ The CLI is the orchestrator. It sends your message to Ollama with tool definitio
 
 These are mature, actively developed projects with larger communities. Purple's angle is different: it ships with useful tools out of the box, handles the XML fallback that open-weight models need, and keeps the entire codebase small enough to read in one sitting. If you want a full-featured TUI, use ollmcp. If you want multi-provider support, use mcp-client-cli. If you want something you can understand and hack on in an afternoon, use Purple.
 
+## Troubleshooting
+
+**"Could not open requirements file"** -- Make sure you're in the `~/.purple` directory: `cd ~/.purple` then `pip install -r requirements.txt`.
+
+**"No module named 'fastmcp'"** -- Dependencies aren't installed. Run `pip install -r requirements.txt` inside your virtual environment.
+
+**"Cannot connect to Ollama" on startup** -- Ollama isn't running. Start it with `ollama serve` or check that it's listening on `http://localhost:11434`.
+
+**"Config not found: mcp.json"** -- Run `cp config/mcp.example.json config/mcp.json`, or let the CLI auto-create it on next run.
+
+**MCP server won't start** -- If you installed in a venv, update `config/mcp.json` to use the full path to your venv's Python (e.g., `"/home/you/.purple/venv/bin/python3"`).
+
+**"model 'purple:latest' not found"** -- Either create it with `ollama create purple -f config/Modelfile`, or set a different model: `OLLAMA_MODEL=qwen3-coder:30b python cli/purple.py`.
+
 ## Requirements
 
 - Python 3.11+
@@ -121,16 +183,28 @@ These are mature, actively developed projects with larger communities. Purple's 
 ## Project Structure
 
 ```
-.purple/
-  cli/purple.py          # CLI + Ollama client + MCP orchestrator (600 lines)
-  memory/server.py       # SQLite memory MCP server (150 lines)
-  docs/server.py         # Document handling MCP server (445 lines)
-  config/mcp.json        # MCP server declarations
-  config/Modelfile       # Ollama model definition
-  identity/identity.md   # System prompt (your config, not committed)
-  requirements.txt       # Python dependencies
-  pyproject.toml         # Package metadata
+~/.purple/
+  cli/purple.py              # CLI + Ollama client + MCP orchestrator (~630 lines)
+  memory/server.py           # SQLite memory MCP server (~155 lines)
+  docs/server.py             # Document handling MCP server (~460 lines)
+  config/mcp.json            # MCP server declarations (created from example)
+  config/mcp.example.json    # Example config (committed to repo)
+  config/Modelfile           # Ollama model definition
+  identity/identity.md       # System prompt (created from example, not committed)
+  identity/identity.example.md  # Example identity (committed to repo)
+  requirements.txt           # Python dependencies
+  pyproject.toml             # Package metadata
+  setup.sh                   # One-command setup script
 ```
+
+## Running Tests
+
+```bash
+source venv/bin/activate
+python -m pytest tests/ -v
+```
+
+All tests run without Ollama -- external dependencies are mocked.
 
 ## License
 

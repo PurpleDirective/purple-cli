@@ -5,7 +5,7 @@ All tests run WITHOUT Ollama. External dependencies (MCP servers, Ollama,
 filesystem side effects) are mocked where necessary.
 
 Run:
-    /Users/purple/.purple/venv/bin/python -m pytest /Users/purple/.purple/tests/test_purple.py -v
+    python -m pytest tests/test_purple.py -v
 """
 
 import importlib

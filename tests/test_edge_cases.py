@@ -8,7 +8,7 @@ Written by Keenness agent. These tests target gaps found in the Wave 1 test suit
   - Platform: macOS /tmp symlink, /var/folders exclusion, null bytes in paths
 
 Run:
-    /Users/purple/.purple/venv/bin/python -m pytest /Users/purple/.purple/tests/test_edge_cases.py -v
+    python -m pytest tests/test_edge_cases.py -v
 """
 
 import importlib
@@ -101,7 +101,7 @@ class TestPathValidationSecurity:
     def test_null_byte_in_path_raises(self):
         """Null byte injection in filenames should raise ValueError from OS."""
         with pytest.raises(ValueError, match="null"):
-            Path("/Users/purple/test\x00evil.txt").resolve()
+            Path("/tmp/test\x00evil.txt").resolve()
 
     def test_read_excel_has_path_validation(self):
         """FIXED: read_excel now calls _validate_path."""

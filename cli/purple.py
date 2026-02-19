@@ -105,6 +105,12 @@ def _parse_xml_tool_calls(content: str) -> list[dict] | None:
 
 def load_identity() -> str:
     """Load the Purple identity file as a system prompt."""
+    if not IDENTITY_PATH.exists():
+        example = IDENTITY_PATH.parent / "identity.example.md"
+        if example.exists():
+            import shutil
+            shutil.copy2(example, IDENTITY_PATH)
+            print(f"{C_GREEN}[setup] Created identity from example: {IDENTITY_PATH}{C_RESET}")
     if IDENTITY_PATH.exists():
         return IDENTITY_PATH.read_text().strip()
     print(f"{C_DIM}[warn] Identity file not found at {IDENTITY_PATH}{C_RESET}")
@@ -130,10 +136,16 @@ class MCPToolManager:
         Each server entry has a "command" array and an "enabled" flag.
         Uses StdioTransport for all servers (Python, npx, or any executable).
         """
-        # Load server config
+        # Load server config (auto-create from example if missing)
         if not MCP_CONFIG_PATH.exists():
-            print(f"{C_RED}[mcp] Config not found: {MCP_CONFIG_PATH}{C_RESET}")
-            return
+            example = MCP_CONFIG_PATH.parent / "mcp.example.json"
+            if example.exists():
+                import shutil
+                shutil.copy2(example, MCP_CONFIG_PATH)
+                print(f"{C_GREEN}[setup] Created MCP config from example: {MCP_CONFIG_PATH}{C_RESET}")
+            else:
+                print(f"{C_RED}[mcp] Config not found: {MCP_CONFIG_PATH}{C_RESET}")
+                return
 
         try:
             config = json.loads(MCP_CONFIG_PATH.read_text())

@@ -27,6 +27,10 @@ if [ ! -f "identity/identity.md" ]; then
     echo "Created identity/identity.md from example"
 fi
 
+# Create data directories
+mkdir -p sessions
+mkdir -p teaching/{queue,compiled,audit,verify,finetune}
+
 echo ""
 echo "Setup complete. To run Purple CLI:"
 echo ""

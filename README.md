@@ -1,6 +1,6 @@
 # Purple CLI
 
-A local AI agent that connects Ollama to MCP tools. ~1200 lines of Python across 3 files. No frameworks, no OpenAI shims, no abstractions between you and the model.
+A local AI agent that connects Ollama to MCP tools. ~3000 lines of Python across 6 files. No frameworks, no OpenAI shims, no abstractions between you and the model.
 
 ![Purple CLI demo](demo.gif)
 
@@ -15,9 +15,20 @@ A local AI agent that connects Ollama to MCP tools. ~1200 lines of Python across
 - Injects a system prompt from a Markdown identity file
 - Runs interactive or one-shot (`python purple.py "your prompt"`)
 
+### New in v0.2
+
+- **Session transcript logging** -- Every conversation saved as JSONL for review and verification
+- **Persistent readline history** -- Up-arrow recall across sessions, tab-complete for `/commands`
+- **Terminal dashboard** -- 256-color ANSI display with rounded boxes, progress bars, metrics
+- **Proving Ground tier system** -- Track model performance (TCR, FTA, UOR), auto-promote/demote
+- **Teaching knowledge server** -- Cloud-to-local knowledge transfer via MCP (9 tools)
+- **Tool budget enforcement** -- Caps on sequential thinking and empty lookups to prevent tool loops
+- **Code gen benchmarks** -- Canary tests that send tasks to Ollama, run pytest, log pass/fail
+- **New commands:** `/knowledge`, `/history`, `/model`, `/sessions`
+
 ## Batteries Included
 
-Ships with 2 MCP servers:
+Ships with 3 MCP servers:
 
 **purple-memory** -- SQLite persistent memory (4 tools)
 - `store_memory` -- Save facts, preferences, experiences, corrections
@@ -33,7 +44,14 @@ Ships with 2 MCP servers:
 - `create_powerpoint` -- Create presentations with multiple layouts
 - `list_directory` -- Browse files with size and type info
 
-Both servers enforce path validation -- file operations are restricted to the home directory and `/tmp`.
+**purple-knowledge** -- Teaching knowledge base (9 tools)
+- `lookup_knowledge` / `store_knowledge` -- Query and build a verified knowledge base
+- `validate_teaching` / `import_queue` -- Process teaching fragments from cloud AI sessions
+- `log_outcome` / `teaching_effectiveness` -- Track which knowledge actually helps
+- `store_training_example` / `export_training_data` -- Accumulate fine-tuning data
+- `list_domains` -- Browse knowledge categories
+
+All servers enforce path validation -- file operations are restricted to the home directory and `/tmp`.
 
 ## Prerequisites
 
@@ -154,9 +172,9 @@ Server commands run from the `~/.purple` directory. If you installed into a virt
 | Tool call fallback | XML parsing for broken JSON | None | None |
 | Streaming | Yes | Yes | Yes |
 | Context management | Sliding window trim | Keep Tokens + history export | Token tracking + session persistence |
-| Bundled tools | 10 tools (memory, PDF, Excel, Word, PPTX) | None (bring your own) | None (bring your own) |
+| Bundled tools | 19 tools (memory, docs, knowledge) | None (bring your own) | None (bring your own) |
 | Config format | JSON | TOML | JSON |
-| Codebase | ~1200 lines, 3 files | Larger, full TUI | Smaller, multi-LLM focus |
+| Codebase | ~3000 lines, 6 files | Larger, full TUI | Smaller, multi-LLM focus |
 
 These are mature, actively developed projects with larger communities. Purple's angle is different: it ships with useful tools out of the box, handles the XML fallback that open-weight models need, and keeps the entire codebase small enough to read in one sitting. If you want a full-featured TUI, use ollmcp. If you want multi-provider support, use mcp-client-cli. If you want something you can understand and hack on in an afternoon, use Purple.
 
@@ -184,14 +202,21 @@ These are mature, actively developed projects with larger communities. Purple's 
 
 ```
 ~/.purple/
-  cli/purple.py              # CLI + Ollama client + MCP orchestrator (~630 lines)
-  memory/server.py           # SQLite memory MCP server (~155 lines)
+  cli/
+    purple.py                # CLI + Ollama client + MCP orchestrator (~1008 lines)
+    dashboard.py             # 256-color terminal display renderer (~289 lines)
+    tracker.py               # SQLite tier tracker + metrics (~369 lines)
+  memory/server.py           # SQLite memory MCP server (~556 lines)
   docs/server.py             # Document handling MCP server (~460 lines)
+  knowledge/server.py        # Teaching knowledge base MCP server (~578 lines)
+  eval/canary.py             # Code gen benchmarks (~248 lines)
   config/mcp.json            # MCP server declarations (created from example)
   config/mcp.example.json    # Example config (committed to repo)
   config/Modelfile           # Ollama model definition
   identity/identity.md       # System prompt (created from example, not committed)
   identity/identity.example.md  # Example identity (committed to repo)
+  sessions/                  # JSONL conversation transcripts (not committed)
+  teaching/                  # Teaching fragment queue + compiled data (not committed)
   requirements.txt           # Python dependencies
   pyproject.toml             # Package metadata
   setup.sh                   # One-command setup script

@@ -7,6 +7,10 @@
     "purple-docs": {
       "command": ["python3", "docs/server.py"],
       "enabled": true
+    },
+    "purple-knowledge": {
+      "command": ["python3", "knowledge/server.py"],
+      "enabled": true
     }
   }
 }

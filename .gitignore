@@ -28,8 +28,19 @@ credentials/
 # Local config (personal paths -- use mcp.example.json as template)
 config/mcp.json
 
-# Logs
+# User data (never commit)
+cli/history
 cli/mcp.log
+sessions/*.jsonl
+eval/log.csv
+
+# Teaching data (structure committed, content is per-installation)
+teaching/queue/*.md
+teaching/compiled/*
+teaching/audit/*
+teaching/verify/*
+teaching/finetune/*
+!teaching/**/.gitkeep
 
 # Demo source (keep generated outputs)
 demo.tape

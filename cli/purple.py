@@ -14,14 +14,23 @@ Usage:
 import asyncio
 import json
 import re
+import readline
 import sys
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastmcp.client import Client
 from fastmcp.client.transports import StdioTransport
+
+# Proving Ground tracker
+_cli_dir = str(Path(__file__).parent)
+if _cli_dir not in sys.path:
+    sys.path.insert(0, _cli_dir)
+import tracker
+import dashboard as proving_ground
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,19 +42,126 @@ IDENTITY_PATH = Path.home() / ".purple" / "identity" / "identity.md"
 MCP_CONFIG_PATH = Path.home() / ".purple" / "config" / "mcp.json"
 
 MAX_TOOL_ROUNDS = 10
+MAX_THINKING_CALLS = 3    # Cap sequentialthinking per chat turn
+MAX_EMPTY_LOOKUPS = 2     # Stop searching empty knowledge base after N misses
 MAX_HISTORY_TOKENS = 50000  # Leave ~15K for system prompt + tool defs
 OLLAMA_TIMEOUT = 300.0  # seconds -- model can be slow on first load
 NUM_CTX = 65536  # Match Modelfile's 64K context
 
-# ANSI colors for terminal output
+# Session logging
+SESSIONS_DIR = Path.home() / ".purple" / "sessions"
+HISTORY_FILE = Path.home() / ".purple" / "cli" / "history"
+
+# ── ANSI Colors ────────────────────────────────────────────────────────────
+# 256-color palette for richer Purple aesthetic
 C_RESET = "\033[0m"
-C_PURPLE = "\033[35m"
-C_DIM = "\033[2m"
-C_CYAN = "\033[36m"
-C_RED = "\033[31m"
-C_GREEN = "\033[32m"
 C_BOLD = "\033[1m"
-C_YELLOW = "\033[33m"
+C_DIM = "\033[2m"
+C_ITALIC = "\033[3m"
+C_PURPLE = "\033[38;5;141m"      # Soft lavender purple
+C_DEEP_PURPLE = "\033[38;5;99m"  # Deeper purple for accents
+C_CYAN = "\033[38;5;117m"        # Soft cyan
+C_GREEN = "\033[38;5;114m"       # Soft green
+C_YELLOW = "\033[38;5;221m"      # Warm amber
+C_RED = "\033[38;5;167m"         # Soft coral red
+C_WHITE = "\033[38;5;252m"       # Soft white
+C_MUTED = "\033[38;5;245m"       # Muted gray
+C_BORDER = "\033[38;5;60m"       # Subtle purple-gray
+
+# ── Markers ────────────────────────────────────────────────────────────────
+DIAMOND = "◆"      # Brand mark (gemstone)
+DIAMOND_SM = "◇"   # Outline diamond
+ARROW_R = "▸"      # Prompt arrow
+DOT = "●"          # Status dot
+
+
+# ---------------------------------------------------------------------------
+# Session transcript logger
+# ---------------------------------------------------------------------------
+
+class SessionLogger:
+    """Logs session transcripts as JSONL for the overnight verification pipeline."""
+
+    def __init__(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        self._file = SESSIONS_DIR / f"{self._session_id}.jsonl"
+        self._count = 0
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def log(self, role: str, content: str, **extra):
+        """Append a message to the session transcript."""
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "role": role,
+            "content": content,
+            **extra,
+        }
+        with open(self._file, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._count += 1
+
+    def log_tool_call(self, name: str, args: dict, result: str, is_error: bool):
+        """Log a tool call and its result."""
+        self.log("tool_call", "", tool=name, arguments=args,
+                 result=result[:2000], is_error=is_error)
+
+    @property
+    def message_count(self) -> int:
+        return self._count
+
+    @staticmethod
+    def list_sessions(limit: int = 10) -> list[dict]:
+        """List recent session files with metadata."""
+        if not SESSIONS_DIR.exists():
+            return []
+        files = sorted(SESSIONS_DIR.glob("*.jsonl"), reverse=True)[:limit]
+        sessions = []
+        for f in files:
+            lines = f.read_text().strip().split("\n")
+            msg_count = len(lines)
+            # Get first user message as preview
+            preview = ""
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    if entry.get("role") == "user":
+                        preview = entry.get("content", "")[:60]
+                        break
+                except json.JSONDecodeError:
+                    continue
+            sessions.append({
+                "id": f.stem,
+                "messages": msg_count,
+                "preview": preview,
+                "size": f.stat().st_size,
+            })
+        return sessions
+
+
+def _tool_args_summary(args: dict) -> str:
+    """Extract a human-readable summary from tool arguments."""
+    if not args:
+        return ""
+    # Look for the most descriptive string value
+    for key in ("query", "text", "content", "prompt", "path", "name",
+                "key", "topic", "thought", "message"):
+        if key in args and isinstance(args[key], str):
+            val = args[key]
+            if len(val) > 60:
+                val = val[:57] + "..."
+            return f'"{val}"'
+    # Fallback: first string value
+    for val in args.values():
+        if isinstance(val, str) and len(val) > 2:
+            if len(val) > 60:
+                val = val[:57] + "..."
+            return f'"{val}"'
+    return ""
+
 
 # XML tool call pattern for Format 2 (Qwen3-Coder fallback)
 _XML_TOOL_CALL_RE = re.compile(
@@ -110,10 +226,10 @@ def load_identity() -> str:
         if example.exists():
             import shutil
             shutil.copy2(example, IDENTITY_PATH)
-            print(f"{C_GREEN}[setup] Created identity from example: {IDENTITY_PATH}{C_RESET}")
+            print(f"  {C_GREEN}{DOT} Created identity from example: {IDENTITY_PATH}{C_RESET}")
     if IDENTITY_PATH.exists():
         return IDENTITY_PATH.read_text().strip()
-    print(f"{C_DIM}[warn] Identity file not found at {IDENTITY_PATH}{C_RESET}")
+    print(f"  {C_MUTED}{DIAMOND_SM} Identity file not found at {IDENTITY_PATH}{C_RESET}")
     return "You are Purple, a local AI assistant."
 
 
@@ -142,27 +258,26 @@ class MCPToolManager:
             if example.exists():
                 import shutil
                 shutil.copy2(example, MCP_CONFIG_PATH)
-                print(f"{C_GREEN}[setup] Created MCP config from example: {MCP_CONFIG_PATH}{C_RESET}")
+                print(f"  {C_GREEN}{DOT} Created MCP config from example: {MCP_CONFIG_PATH}{C_RESET}")
             else:
-                print(f"{C_RED}[mcp] Config not found: {MCP_CONFIG_PATH}{C_RESET}")
+                print(f"  {C_RED}{DOT} MCP config not found: {MCP_CONFIG_PATH}{C_RESET}")
                 return
 
         try:
             config = json.loads(MCP_CONFIG_PATH.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            print(f"{C_RED}[mcp] Failed to read config: {e}{C_RESET}")
+            print(f"  {C_RED}{DOT} MCP config error: {e}{C_RESET}")
             return
 
         servers = config.get("servers", {})
 
         for server_name, server_cfg in servers.items():
             if not server_cfg.get("enabled", True):
-                print(f"{C_DIM}[mcp] {server_name}: disabled, skipping{C_RESET}")
                 continue
 
             cmd = server_cfg.get("command", [])
             if not cmd:
-                print(f"{C_DIM}[warn] {server_name}: no command specified{C_RESET}")
+                print(f"  {C_MUTED}{DIAMOND_SM} {server_name}: no command specified{C_RESET}")
                 continue
 
             try:
@@ -182,10 +297,9 @@ class MCPToolManager:
                     self._tool_map[tool.name] = (server_name, tool)
                     self._ollama_tools.append(self._mcp_to_ollama_tool(tool))
 
-                print(f"{C_DIM}[mcp] {server_name}: {len(tools)} tools loaded{C_RESET}")
 
             except Exception as e:
-                print(f"{C_RED}[mcp] Failed to connect to {server_name}: {e}{C_RESET}")
+                print(f"  {C_RED}{DOT} {server_name}: connection failed — {e}{C_RESET}")
 
     async def disconnect(self):
         """Disconnect from all MCP servers."""
@@ -272,14 +386,19 @@ class MCPToolManager:
 class OllamaChat:
     """Manages conversation with Ollama via native /api/chat."""
 
-    def __init__(self, tool_manager: MCPToolManager):
+    def __init__(self, tool_manager: MCPToolManager, session_logger: SessionLogger):
         self._tool_manager = tool_manager
+        self._session_logger = session_logger
         self._messages: list[dict] = []
         self._system_prompt = load_identity()
         self._http = httpx.AsyncClient(
             base_url=OLLAMA_URL,
             timeout=httpx.Timeout(OLLAMA_TIMEOUT, connect=10.0),
         )
+        self._current_task_id: int | None = None
+        # Per-turn tool budget counters (reset each chat call)
+        self._thinking_calls: int = 0
+        self._empty_lookups: int = 0
 
     async def close(self):
         await self._http.aclose()
@@ -293,15 +412,33 @@ class OllamaChat:
         Returns the final assistant text response (already printed to terminal).
         """
         self._messages.append({"role": "user", "content": user_input})
+        self._session_logger.log("user", user_input)
+
+        # Reset per-turn budget counters
+        self._thinking_calls = 0
+        self._empty_lookups = 0
+
+        # Proving Ground: start tracking this task
+        self._current_task_id = tracker.start_task(user_input, OLLAMA_MODEL)
 
         for round_num in range(MAX_TOOL_ROUNDS):
+            # Continuation rounds get a fresh response prefix with budget indicator
+            if round_num > 0:
+                remaining = MAX_TOOL_ROUNDS - round_num
+                budget_color = C_GREEN if remaining > 4 else (C_YELLOW if remaining > 2 else C_RED)
+                print(f"\n{C_PURPLE}{DIAMOND}{C_RESET} {budget_color}{C_DIM}[{remaining} rounds left]{C_RESET} ", end="", flush=True)
+
             try:
                 response = await self._stream_to_ollama()
             except KeyboardInterrupt:
-                print(f"\n{C_DIM}[stream interrupted]{C_RESET}")
+                print(f"\n{C_MUTED}  {DIAMOND_SM} stream interrupted{C_RESET}")
+                if self._current_task_id is not None:
+                    tracker.complete_task(self._current_task_id, "interrupted", round_num)
                 return "[interrupted]"
 
             if response is None:
+                if self._current_task_id is not None:
+                    tracker.complete_task(self._current_task_id, "failed", round_num)
                 return "[Error: no response from Ollama]"
 
             message = response.get("message", {})
@@ -313,14 +450,18 @@ class OllamaChat:
                 content = message.get("content", "")
                 xml_calls = _parse_xml_tool_calls(content)
                 if xml_calls:
-                    print(f"\n{C_YELLOW}  [detected XML tool call in content -- intercepting]{C_RESET}")
+                    print(f"\n  {C_YELLOW}{DIAMOND_SM} XML tool call detected — intercepting{C_RESET}")
                     tool_calls = xml_calls
 
             if not tool_calls:
                 # No tool calls -- we have a final response (already streamed)
                 content = message.get("content", "")
                 self._messages.append({"role": "assistant", "content": content})
+                self._session_logger.log("assistant", content)
                 print()  # Newline after streamed output
+                # Proving Ground: mark task complete
+                if self._current_task_id is not None:
+                    tracker.complete_task(self._current_task_id, "completed", round_num)
                 return content
 
             # Tool calls detected -- newline after any streamed preamble text
@@ -346,18 +487,75 @@ class OllamaChat:
                 if not isinstance(tool_args, dict):
                     tool_args = {}
 
-                # Print tool call info
-                args_preview = json.dumps(tool_args, ensure_ascii=False)
-                if len(args_preview) > 120:
-                    args_preview = args_preview[:117] + "..."
-                print(f"{C_CYAN}  -> {tool_name}({args_preview}){C_RESET}")
+                # ── Tool budget enforcement ───────────────────────────
+                # Cap sequentialthinking to prevent infinite thinking loops
+                if tool_name == "sequentialthinking":
+                    self._thinking_calls += 1
+                    if self._thinking_calls > MAX_THINKING_CALLS:
+                        print(f"  {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}capped ({MAX_THINKING_CALLS} max) — produce your answer now{C_RESET}")
+                        result = (
+                            f"BUDGET: You have used {MAX_THINKING_CALLS} thinking rounds. "
+                            f"Stop thinking and produce your final answer directly. "
+                            f"You have {MAX_TOOL_ROUNDS - round_num - 1} tool rounds remaining."
+                        )
+                        self._messages.append({"role": "tool", "content": result})
+                        continue
+
+                # Cap repeated empty knowledge lookups
+                if tool_name == "lookup_knowledge":
+                    if self._empty_lookups >= MAX_EMPTY_LOOKUPS:
+                        print(f"  {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}skipped — knowledge base is sparse, proceed without{C_RESET}")
+                        result = (
+                            "BUDGET: The knowledge base has limited entries. "
+                            "Stop searching and answer from your own knowledge. "
+                            f"You have {MAX_TOOL_ROUNDS - round_num - 1} tool rounds remaining."
+                        )
+                        self._messages.append({"role": "tool", "content": result})
+                        continue
+
+                # Print tool call — human-readable
+                summary = _tool_args_summary(tool_args)
+                if summary:
+                    print(f"  {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_MUTED}{summary}{C_RESET}")
+                else:
+                    print(f"  {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}")
 
                 # Execute the tool
                 result = await self._tool_manager.call_tool(tool_name, tool_args)
 
-                # Print brief result
-                result_preview = result[:200] + "..." if len(result) > 200 else result
-                print(f"{C_DIM}  <- {result_preview}{C_RESET}")
+                # Track empty knowledge lookups
+                if tool_name == "lookup_knowledge" and "No knowledge found" in result:
+                    self._empty_lookups += 1
+
+                # Inject budget warning when rounds are running low
+                remaining = MAX_TOOL_ROUNDS - round_num - 1
+                if remaining <= 3 and remaining > 0:
+                    result += (
+                        f"\n\n[SYSTEM: {remaining} tool rounds remaining. "
+                        f"Produce your final answer soon.]"
+                    )
+
+                # Proving Ground: track tool call success/failure
+                is_error = result.startswith("Error:") or result.startswith("Tool error:")
+                if self._current_task_id is not None:
+                    tracker.record_tool_call(self._current_task_id, success=not is_error)
+                self._session_logger.log_tool_call(tool_name, tool_args, result, is_error)
+
+                # Print result — clean and compact
+                if is_error:
+                    # Strip prefixes for cleaner error display
+                    err_msg = result.split(": ", 1)[-1] if ": " in result else result
+                    if len(err_msg) > 80:
+                        err_msg = err_msg[:77] + "..."
+                    print(f"    {C_RED}{DOT} {err_msg}{C_RESET}")
+                else:
+                    preview = result.replace("\n", " ").strip()
+                    if len(preview) > 80:
+                        print(f"    {C_GREEN}{DOT}{C_RESET} {C_MUTED}done ({len(result)} chars){C_RESET}")
+                    elif preview:
+                        print(f"    {C_GREEN}{DOT}{C_RESET} {C_MUTED}{preview}{C_RESET}")
+                    else:
+                        print(f"    {C_GREEN}{DOT}{C_RESET} {C_MUTED}done{C_RESET}")
 
                 # Add tool result to message history
                 self._messages.append({
@@ -365,6 +563,9 @@ class OllamaChat:
                     "content": result,
                 })
 
+        # Proving Ground: mark task as failed (too many rounds)
+        if self._current_task_id is not None:
+            tracker.complete_task(self._current_task_id, "failed", MAX_TOOL_ROUNDS)
         return "[Error: max tool call rounds exceeded]"
 
     def _build_payload(self, *, stream: bool) -> dict[str, Any]:
@@ -390,16 +591,16 @@ class OllamaChat:
             resp.raise_for_status()
             return resp.json()
         except httpx.TimeoutException:
-            print(f"{C_RED}[error] Ollama request timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            print(f"  {C_RED}{DOT} Ollama request timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
             return None
         except httpx.HTTPStatusError as e:
-            print(f"{C_RED}[error] Ollama HTTP {e.response.status_code}: {e.response.text[:200]}{C_RESET}")
+            print(f"  {C_RED}{DOT} Ollama HTTP {e.response.status_code}: {e.response.text[:200]}{C_RESET}")
             return None
         except httpx.ConnectError:
-            print(f"{C_RED}[error] Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
+            print(f"  {C_RED}{DOT} Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
             return None
         except Exception as e:
-            print(f"{C_RED}[error] Ollama request failed: {e}{C_RESET}")
+            print(f"  {C_RED}{DOT} Ollama request failed: {e}{C_RESET}")
             return None
 
     async def _stream_to_ollama(self) -> dict | None:
@@ -448,19 +649,18 @@ class OllamaChat:
                         break
 
         except httpx.TimeoutException:
-            print(f"\n{C_RED}[error] Ollama stream timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            print(f"\n  {C_RED}{DOT} Ollama stream timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
             return None
         except httpx.HTTPStatusError as e:
-            print(f"\n{C_RED}[error] Ollama HTTP {e.response.status_code}{C_RESET}")
-            # Fall back to non-streaming
-            print(f"{C_DIM}[falling back to non-streaming]{C_RESET}")
+            print(f"\n  {C_RED}{DOT} Ollama HTTP {e.response.status_code}{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
         except httpx.ConnectError:
-            print(f"{C_RED}[error] Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
+            print(f"  {C_RED}{DOT} Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
             return None
         except Exception as e:
-            print(f"\n{C_RED}[error] Stream failed: {e}{C_RESET}")
-            print(f"{C_DIM}[falling back to non-streaming]{C_RESET}")
+            print(f"\n  {C_RED}{DOT} Stream failed: {e}{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
 
         # Assemble the response in the same shape as non-streaming
@@ -494,7 +694,7 @@ class OllamaChat:
 
         if len(history) < len(self._messages):
             trimmed = len(self._messages) - len(history)
-            print(f"{C_DIM}[trimmed {trimmed} old messages to stay within context]{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} trimmed {trimmed} old messages to stay within context{C_RESET}")
 
         messages.extend(history)
         return messages
@@ -508,23 +708,55 @@ class OllamaChat:
 # CLI interface
 # ---------------------------------------------------------------------------
 
-def print_banner(tool_manager: MCPToolManager):
-    """Print startup banner."""
-    tools = tool_manager.tool_names
-    print(f"\n{C_BOLD}{C_PURPLE}Purple CLI{C_RESET} -- {OLLAMA_MODEL} via {OLLAMA_URL}")
-    print(f"{C_DIM}Tools: {', '.join(tools) if tools else 'none'}{C_RESET}")
-    print(f"{C_DIM}Commands: /clear (reset), /tools (list), /quit (exit){C_RESET}")
+def print_banner(tool_manager: MCPToolManager, ollama_version: str = ""):
+    """Print startup banner — everything in one clean box."""
+    print(proving_ground.render_compact(
+        OLLAMA_MODEL,
+        ollama_version=ollama_version,
+        tool_count=len(tool_manager.tool_names),
+        server_count=len(tool_manager._clients),
+    ))
     print()
 
 
-async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager):
+def _setup_readline():
+    """Initialize readline with persistent history."""
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        readline.read_history_file(str(HISTORY_FILE))
+    except FileNotFoundError:
+        pass
+    readline.set_history_length(1000)
+    # Tab-complete slash commands
+    commands = ["/clear", "/tools", "/stats", "/rate", "/override",
+                "/promote", "/knowledge", "/history", "/model",
+                "/sessions", "/help", "/quit", "/exit"]
+    def completer(text, state):
+        options = [c for c in commands if c.startswith(text)]
+        return options[state] if state < len(options) else None
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+
+
+def _save_readline():
+    """Save readline history."""
+    try:
+        readline.write_history_file(str(HISTORY_FILE))
+    except OSError:
+        pass
+
+
+async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
+                           session_logger: SessionLogger,
+                           ollama_version: str = ""):
     """Run the interactive input loop."""
-    print_banner(tool_manager)
+    _setup_readline()
+    print_banner(tool_manager, ollama_version)
 
     while True:
         try:
             user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(f"{C_GREEN}you>{C_RESET} ")
+                None, lambda: input(f"{C_CYAN}{ARROW_R}{C_RESET} ")
             )
         except (EOFError, KeyboardInterrupt):
             print()
@@ -541,36 +773,149 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager):
                 break
             elif cmd == "/clear":
                 chat.reset()
-                print(f"{C_DIM}[conversation cleared]{C_RESET}")
+                print(f"  {C_MUTED}{DIAMOND_SM} conversation cleared{C_RESET}")
                 continue
             elif cmd == "/tools":
                 if tool_manager.tool_names:
                     for name in sorted(tool_manager.tool_names):
                         _server, tool = tool_manager._tool_map[name]
                         desc = (tool.description or "")[:80]
-                        print(f"  {C_CYAN}{name}{C_RESET} ({_server}) -- {desc}")
+                        print(f"  {C_CYAN}{ARROW_R}{C_RESET} {C_WHITE}{name}{C_RESET} {C_MUTED}({_server}) {desc}{C_RESET}")
                 else:
-                    print(f"{C_DIM}  No tools available{C_RESET}")
+                    print(f"  {C_MUTED}{DIAMOND_SM} No tools available{C_RESET}")
+                continue
+            elif cmd == "/stats":
+                print(proving_ground.render_full())
+                continue
+            elif cmd.startswith("/rate"):
+                parts = user_input.split()
+                task_id = tracker.get_last_task_id()
+                if task_id is None:
+                    print(f"  {C_MUTED}{DIAMOND_SM} No tasks to rate{C_RESET}")
+                elif len(parts) == 2 and parts[1].isdigit():
+                    rating = int(parts[1])
+                    tracker.rate_task(task_id, rating)
+                    stars = "★" * rating + "☆" * (5 - rating)
+                    print(f"  {C_YELLOW}{stars}{C_RESET} {C_MUTED}task #{task_id}{C_RESET}")
+                else:
+                    print(f"  {C_MUTED}{DIAMOND_SM} Usage: /rate <1-5>{C_RESET}")
+                continue
+            elif cmd == "/override":
+                task_id = tracker.get_last_task_id()
+                if task_id:
+                    tracker.mark_override(task_id)
+                    print(f"  {C_YELLOW}{DIAMOND_SM}{C_RESET} {C_MUTED}Task #{task_id} marked as overridden{C_RESET}")
+                else:
+                    print(f"  {C_MUTED}{DIAMOND_SM} No tasks to mark{C_RESET}")
+                continue
+            elif cmd == "/promote":
+                promo = tracker.check_promotion()
+                if promo:
+                    tier_name = tracker.TIER_NAMES.get(promo, promo)
+                    tracker.apply_tier_change(promo, "Promotion approved by human", OLLAMA_MODEL)
+                    print(f"  {C_GREEN}{C_BOLD}{DIAMOND} Promoted to {tier_name} ({promo}){C_RESET}")
+                else:
+                    print(f"  {C_MUTED}{DIAMOND_SM} Not yet qualified. Use /stats to see requirements.{C_RESET}")
+                continue
+            elif cmd.startswith("/knowledge"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"  {C_MUTED}{DIAMOND_SM} Usage: /knowledge <query>{C_RESET}")
+                else:
+                    query = parts[1]
+                    result = await tool_manager.call_tool("lookup_knowledge", {"query": query})
+                    if result.startswith("Error:") or result.startswith("Tool error:"):
+                        print(f"  {C_RED}{DOT} {result}{C_RESET}")
+                    elif "No knowledge found" in result:
+                        print(f"  {C_MUTED}{DIAMOND_SM} No knowledge found for '{query}'{C_RESET}")
+                    else:
+                        print(f"  {C_GREEN}{DOT}{C_RESET} {result[:500]}")
+                continue
+            elif cmd == "/history":
+                import sqlite3
+                conn = sqlite3.connect(str(tracker.DB_PATH))
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id, started_at, prompt_preview, outcome, tool_calls, tool_errors, user_rating "
+                    "FROM tasks ORDER BY id DESC LIMIT 15"
+                ).fetchall()
+                conn.close()
+                if not rows:
+                    print(f"  {C_MUTED}{DIAMOND_SM} No task history{C_RESET}")
+                else:
+                    for r in reversed(rows):
+                        ts = r["started_at"][11:16] if r["started_at"] else "??:??"
+                        outcome_icon = f"{C_GREEN}{DOT}{C_RESET}" if r["outcome"] == "completed" else f"{C_RED}{DOT}{C_RESET}"
+                        preview = (r["prompt_preview"] or "")[:45]
+                        tools = f"{r['tool_calls']}t" if r["tool_calls"] else ""
+                        rating = f" {C_YELLOW}{'★' * r['user_rating']}{C_RESET}" if r["user_rating"] else ""
+                        print(f"  {C_MUTED}#{r['id']:>3} {ts}{C_RESET} {outcome_icon} {C_WHITE}{preview}{C_RESET} {C_MUTED}{tools}{C_RESET}{rating}")
+                continue
+            elif cmd.startswith("/model"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"  {C_WHITE}{OLLAMA_MODEL}{C_RESET}")
+                    # List available models
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as http:
+                            resp = await http.get(f"{OLLAMA_URL}/api/tags")
+                            resp.raise_for_status()
+                            models = resp.json().get("models", [])
+                            for m in models[:10]:
+                                name = m.get("name", "?")
+                                size = m.get("size", 0) / 1e9
+                                mark = f"{C_GREEN}{DOT}{C_RESET}" if name == OLLAMA_MODEL else f"{C_MUTED}{DIAMOND_SM}{C_RESET}"
+                                print(f"  {mark} {C_WHITE}{name}{C_RESET} {C_MUTED}{size:.1f}GB{C_RESET}")
+                    except Exception:
+                        pass
+                else:
+                    new_model = parts[1].strip()
+                    _this = sys.modules[__name__]
+                    _this.OLLAMA_MODEL = new_model
+                    if tracker.check_model_change(new_model):
+                        print(f"  {C_YELLOW}{DIAMOND_SM} Model changed — tier reset to T0{C_RESET}")
+                    print(f"  {C_GREEN}{DOT}{C_RESET} Model set to {C_WHITE}{new_model}{C_RESET}")
+                continue
+            elif cmd == "/sessions":
+                sessions = SessionLogger.list_sessions(limit=10)
+                if not sessions:
+                    print(f"  {C_MUTED}{DIAMOND_SM} No sessions saved{C_RESET}")
+                else:
+                    for s in sessions:
+                        size_kb = s["size"] / 1024
+                        print(f"  {C_MUTED}{s['id']}{C_RESET}  {C_WHITE}{s['messages']} msgs{C_RESET}  {C_MUTED}{size_kb:.1f}KB{C_RESET}  {C_MUTED}{s['preview']}{C_RESET}")
                 continue
             elif cmd == "/help":
-                print(f"  /clear  -- Reset conversation history")
-                print(f"  /tools  -- List available MCP tools")
-                print(f"  /quit   -- Exit")
+                print(f"  {C_BOLD}{C_WHITE}Chat{C_RESET}")
+                print(f"  {C_WHITE}/clear{C_RESET}      {C_MUTED}─ Reset conversation{C_RESET}")
+                print(f"  {C_WHITE}/model [M]{C_RESET}  {C_MUTED}─ Show/change model{C_RESET}")
+                print(f"  {C_WHITE}/tools{C_RESET}      {C_MUTED}─ List MCP tools{C_RESET}")
+                print(f"  {C_WHITE}/knowledge{C_RESET}  {C_MUTED}─ Query knowledge base{C_RESET}")
+                print()
+                print(f"  {C_BOLD}{C_WHITE}Proving Ground{C_RESET}")
+                print(f"  {C_WHITE}/stats{C_RESET}      {C_MUTED}─ Full statistics{C_RESET}")
+                print(f"  {C_WHITE}/history{C_RESET}    {C_MUTED}─ Recent tasks{C_RESET}")
+                print(f"  {C_WHITE}/rate N{C_RESET}     {C_MUTED}─ Rate last response (1-5){C_RESET}")
+                print(f"  {C_WHITE}/override{C_RESET}   {C_MUTED}─ Mark last task as corrected{C_RESET}")
+                print(f"  {C_WHITE}/promote{C_RESET}    {C_MUTED}─ Approve tier promotion{C_RESET}")
+                print(f"  {C_WHITE}/sessions{C_RESET}   {C_MUTED}─ List saved sessions{C_RESET}")
+                print()
+                print(f"  {C_WHITE}/quit{C_RESET}       {C_MUTED}─ Exit{C_RESET}")
                 continue
             else:
-                print(f"{C_DIM}  Unknown command. Try /help{C_RESET}")
+                print(f"  {C_MUTED}{DIAMOND_SM} Unknown command. Try /help{C_RESET}")
                 continue
 
         # Send to Purple -- response text streams inline during chat()
-        print(f"{C_PURPLE}purple>{C_RESET} ", end="", flush=True)
+        print(f"{C_PURPLE}{DIAMOND}{C_RESET} ", end="", flush=True)
         try:
             await chat.chat(user_input)
             # chat() already printed the streamed text and a trailing newline
         except KeyboardInterrupt:
-            print(f"\n{C_DIM}[interrupted]{C_RESET}\n")
+            print(f"\n  {C_MUTED}{DIAMOND_SM} interrupted{C_RESET}\n")
             continue
         except asyncio.CancelledError:
-            print(f"\n{C_DIM}[cancelled]{C_RESET}\n")
+            print(f"\n  {C_MUTED}{DIAMOND_SM} cancelled{C_RESET}\n")
             continue
 
 
@@ -583,38 +928,45 @@ async def one_shot(chat: OllamaChat, prompt: str):
 # Main
 # ---------------------------------------------------------------------------
 
-async def _check_ollama() -> bool:
-    """Verify Ollama is reachable before starting. Returns True if healthy."""
+async def _check_ollama() -> tuple[bool, str]:
+    """Verify Ollama is reachable. Returns (healthy, version_string)."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{OLLAMA_URL}/api/version")
             resp.raise_for_status()
             version = resp.json().get("version", "unknown")
-            print(f"{C_DIM}[ollama] Connected -- v{version}{C_RESET}")
-            return True
+            return True, version
     except httpx.ConnectError:
-        print(f"{C_RED}[error] Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
-        print(f"{C_DIM}  Start it with: ollama serve{C_RESET}")
-        return False
+        print(f"  {C_RED}{DOT} Cannot connect to Ollama at {OLLAMA_URL}{C_RESET}")
+        print(f"  {C_MUTED}  Start it with: ollama serve{C_RESET}")
+        return False, ""
     except Exception as e:
-        print(f"{C_YELLOW}[warn] Ollama health check failed: {e}{C_RESET}")
-        return True  # Proceed anyway -- might still work
+        print(f"  {C_YELLOW}{DIAMOND_SM} Ollama health check failed: {e}{C_RESET}")
+        return True, ""  # Proceed anyway -- might still work
 
 
 async def main():
     tool_manager = MCPToolManager()
+    session_logger = SessionLogger()
     chat = None
+    ollama_version = ""
+
+    # Initialize Proving Ground tracker
+    tracker.init_db()
+    if tracker.check_model_change(OLLAMA_MODEL):
+        print(f"  {C_YELLOW}{DIAMOND_SM} Model changed — tier reset to T0 (Candidate){C_RESET}")
 
     try:
         # Verify Ollama is reachable
-        if not await _check_ollama():
+        healthy, ollama_version = await _check_ollama()
+        if not healthy:
             return
 
-        # Connect to MCP servers
+        # Connect to MCP servers (silent — results shown in banner)
         await tool_manager.connect()
 
         # Create chat client
-        chat = OllamaChat(tool_manager)
+        chat = OllamaChat(tool_manager, session_logger)
 
         if len(sys.argv) > 1:
             # One-shot mode: join all args as prompt
@@ -622,15 +974,29 @@ async def main():
             await one_shot(chat, prompt)
         else:
             # Interactive mode
-            await interactive_loop(chat, tool_manager)
+            await interactive_loop(chat, tool_manager, session_logger, ollama_version)
 
     except KeyboardInterrupt:
         pass
     finally:
+        # Auto-demotion check at session end
+        demotion = tracker.check_demotion()
+        if demotion:
+            old_tier = tracker.get_current_tier()
+            tracker.apply_tier_change(demotion, "Auto-demotion: TCR below floor", OLLAMA_MODEL)
+            old_name = tracker.TIER_NAMES.get(old_tier, old_tier)
+            new_name = tracker.TIER_NAMES.get(demotion, demotion)
+            print(f"\n  {C_RED}{DIAMOND} Demoted: {old_name} → {new_name}{C_RESET}")
+
         if chat:
             await chat.close()
         await tool_manager.disconnect()
-        print(f"\n{C_DIM}[purple offline]{C_RESET}")
+        _save_readline()
+
+        # Session summary
+        if session_logger.message_count > 0:
+            print(f"\n  {C_MUTED}{DIAMOND_SM} session {session_logger.session_id} · {session_logger.message_count} messages logged{C_RESET}")
+        print(f"  {C_MUTED}{DIAMOND_SM} purple offline{C_RESET}")
 
 
 def main_sync():

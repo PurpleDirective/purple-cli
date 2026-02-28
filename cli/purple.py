@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Purple CLI -- Native Ollama + MCP Orchestrator
+Purple CLI -- Local AI Inference + MCP Orchestrator
 
-Talks to Ollama via native /api/chat (NOT the broken /v1 endpoint).
+Supports two inference backends:
+  - Ollama (/api/chat)     -- for GGUF models via llama.cpp
+  - vllm-mlx (/v1/chat)   -- for MLX models via Apple Metal (2x faster on MoE)
+
+Auto-detects the best backend at startup. Override with PURPLE_BACKEND env var.
 Executes MCP tool calls directly via FastMCP STDIO clients.
-Bypasses the lossy AI SDK translation layer entirely.
 
 Usage:
     Interactive:  python purple.py
     One-shot:     python purple.py "your prompt here"
+
+Environment:
+    PURPLE_BACKEND  auto|ollama|vllm-mlx  (default: auto)
+    OLLAMA_URL      http://localhost:11434
+    VLLM_URL        http://localhost:8000
+    OLLAMA_MODEL    purple:latest (auto-detected from vllm-mlx if available)
 """
 
 import asyncio
 import json
 import re
 import readline
+import shutil
 import sys
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,7 +48,9 @@ import dashboard as proving_ground
 # ---------------------------------------------------------------------------
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "purple:latest")
+PURPLE_BACKEND = os.environ.get("PURPLE_BACKEND", "auto")  # "auto", "ollama", "vllm-mlx"
 IDENTITY_PATH = Path.home() / ".purple" / "identity" / "identity.md"
 MCP_CONFIG_PATH = Path.home() / ".purple" / "config" / "mcp.json"
 
@@ -46,7 +59,86 @@ MAX_THINKING_CALLS = 3    # Cap sequentialthinking per chat turn
 MAX_EMPTY_LOOKUPS = 2     # Stop searching empty knowledge base after N misses
 MAX_HISTORY_TOKENS = 50000  # Leave ~15K for system prompt + tool defs
 OLLAMA_TIMEOUT = 300.0  # seconds -- model can be slow on first load
+VLLM_MAX_PLAN_TOKENS = 8192  # Higher token limit for planning (thinking uses tokens)
+
+# ── Planning mode system prompt ───────────────────────────────────────────
+PLANNING_PROMPT = """You are Purple in planning mode. Your job is to help your operator think through a problem BEFORE writing code.
+
+## Planning Rules
+
+- Ask clarifying questions before proposing solutions. Do not assume requirements.
+- Think step by step. Break complex problems into smaller pieces.
+- When you know something (algorithms, patterns, architecture), reason from it confidently.
+- When you DON'T know something (platform specifics, API details, pricing, real-world facts), say so explicitly: "I'm not confident about X — verify this."
+- Never invent platform names, tool names, product names, or specific dollar amounts. If you can't verify it from your training, flag it.
+- Propose 2-3 approaches when multiple valid options exist. Explain tradeoffs.
+- End each response with a clear next question or a summary of the agreed plan.
+- No tool calls in planning mode. This is pure reasoning and discussion.
+- Keep your operator's constraints in mind: local-first, privacy-respecting, sovereignty matters.
+
+## Output Format
+
+Structure your planning responses as:
+1. **Understanding** — restate what you think the operator wants
+2. **Questions** — what you need to know before proceeding
+3. **Approach** — proposed solution(s) with tradeoffs
+4. **Next step** — what to discuss or decide next
+
+When the plan is solid, the operator will use /build to switch to execution mode."""
+
+# ── Friendly model name mapping ──────────────────────────────────────────
+# Maps substrings (lowercase) found in raw model IDs to (display_name, params)
+_MODEL_FRIENDLY = {
+    "qwen3-coder-next": ("Qwen 3 Coder", "80B"),
+    "qwen3.5-27b":      ("Qwen 3.5", "27B"),
+    "qwen3.5-122b":     ("Qwen 3.5", "122B"),
+    "qwen3.5-35b":      ("Qwen 3.5", "35B"),
+    "qwen3-coder":      ("Qwen 3 Coder", "30B"),
+    "llama3.1:70b":     ("Llama 3.1", "70B"),
+    "llama3.1:8b":      ("Llama 3.1", "8B"),
+}
+
+
+def friendly_model_name(raw_id: str) -> str:
+    """Convert a raw model ID or HuggingFace cache path to a clean display name.
+
+    Examples:
+        '/Users/...models--Eldadalbajob--Huihui-Qwen3-Coder-Next-abliterated-mlx-4Bit/snapshots/...'
+        → 'Qwen 3 Coder (80B) 4-bit'
+
+        'lmstudio-community/Qwen3-Coder-Next-MLX-6bit'
+        → 'Qwen 3 Coder (80B) 6-bit'
+    """
+    # Extract model slug from HuggingFace cache paths
+    slug = raw_id
+    match = re.search(r'models--[^/]+--([^/]+)', slug)
+    if match:
+        slug = match.group(1)
+    elif "/" in slug:
+        slug = slug.rsplit("/", 1)[-1]
+
+    lower = slug.lower()
+
+    # Detect quantization
+    quant = ""
+    for q in ("4bit", "4-bit", "q4_k_m", "6bit", "6-bit", "8bit", "8-bit"):
+        if q in lower:
+            bits = q.replace("bit", "").replace("-", "").replace("_k_m", "")
+            quant = f" {bits}-bit"
+            break
+
+    # Match against known models (longest match first)
+    for pattern, (name, params) in sorted(_MODEL_FRIENDLY.items(), key=lambda x: -len(x[0])):
+        if pattern in lower:
+            return f"{name} ({params}{quant})"
+
+    # Fallback: strip common suffixes and return cleaned slug
+    for suffix in ("-MLX-6bit", "-MLX-4bit", "-mlx-4Bit", "-GGUF",
+                   "-Q4_K_M", "-abliterated", "-instruct"):
+        slug = slug.replace(suffix, "")
+    return slug
 NUM_CTX = 65536  # Match Modelfile's 64K context
+VLLM_MAX_TOKENS = 4096  # Max generation tokens for vllm-mlx
 
 # Session logging
 SESSIONS_DIR = Path.home() / ".purple" / "sessions"
@@ -108,6 +200,33 @@ class SessionLogger:
         """Log a tool call and its result."""
         self.log("tool_call", "", tool=name, arguments=args,
                  result=result[:2000], is_error=is_error)
+
+    def log_timing(self, round_num: int, timing: dict):
+        """Log per-turn performance metrics (tok/s, TTFT, gen time, tokens)."""
+        self.log("timing", "", round=round_num,
+                 tokens=timing.get("tokens", 0),
+                 ttft=round(timing.get("ttft", 0), 4),
+                 gen_seconds=round(timing.get("gen", 0), 3),
+                 total_seconds=round(timing.get("total", 0), 3),
+                 tok_per_sec=round(timing.get("tokens", 0) / timing["gen"], 1)
+                 if timing.get("gen", 0) > 0 else 0)
+
+    def log_session_meta(self, model: str, backend: str, tier: str,
+                         tool_count: int, server_count: int):
+        """Log session-level metadata at startup."""
+        self.log("session_start", "", model=model,
+                 friendly_name=friendly_model_name(model),
+                 backend=backend, tier=tier,
+                 tool_count=tool_count, server_count=server_count)
+
+    def log_task_outcome(self, task_id: int, outcome: str, rounds: int,
+                         total_timing: dict, user_rating: int | None = None):
+        """Log task completion with outcome and aggregate timing for fine-tuning extraction."""
+        self.log("task_outcome", "", task_id=task_id, outcome=outcome,
+                 rounds=rounds, user_rating=user_rating,
+                 total_tokens=total_timing.get("tokens", 0),
+                 total_seconds=round(total_timing.get("total", 0), 2),
+                 avg_tok_per_sec=round(total_timing.get("tok_per_sec", 0), 1))
 
     @property
     def message_count(self) -> int:
@@ -384,21 +503,51 @@ class MCPToolManager:
 # ---------------------------------------------------------------------------
 
 class OllamaChat:
-    """Manages conversation with Ollama via native /api/chat."""
+    """Manages conversation with Ollama or vllm-mlx inference backends."""
 
-    def __init__(self, tool_manager: MCPToolManager, session_logger: SessionLogger):
+    def __init__(self, tool_manager: MCPToolManager, session_logger: SessionLogger,
+                 backend: str = "ollama"):
         self._tool_manager = tool_manager
         self._session_logger = session_logger
         self._messages: list[dict] = []
         self._system_prompt = load_identity()
+        # Inject current date so the model uses the correct year in searches
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._system_prompt += (
+            f"\n\n## Current Date\n"
+            f"Today is {today}. Always use the year {datetime.now().year} "
+            f"in search queries, trend references, and date-sensitive claims."
+        )
+        self._backend = backend  # "ollama" or "vllm-mlx"
+        base_url = VLLM_URL if backend == "vllm-mlx" else OLLAMA_URL
         self._http = httpx.AsyncClient(
-            base_url=OLLAMA_URL,
+            base_url=base_url,
             timeout=httpx.Timeout(OLLAMA_TIMEOUT, connect=10.0),
         )
         self._current_task_id: int | None = None
+        self._plan_mode: bool = False
         # Per-turn tool budget counters (reset each chat call)
         self._thinking_calls: int = 0
         self._empty_lookups: int = 0
+        # Per-turn timing
+        self._round_timings: list[dict] = []
+        # Streaming indent tracking
+        self._col: int = 0
+
+    def _print_fragment(self, fragment: str):
+        """Print a streaming fragment with 2-space indent on new lines."""
+        for char in fragment:
+            if char == '\n':
+                print('\n  ', end='', flush=True)
+                self._col = 2
+            else:
+                print(char, end='', flush=True)
+                self._col += 1
+
+    def _turn_separator(self):
+        """Print a subtle divider between conversation turns."""
+        width = min(shutil.get_terminal_size().columns, 72)
+        print(f"\n{C_BORDER}{'─' * width}{C_RESET}\n")
 
     async def close(self):
         await self._http.aclose()
@@ -417,6 +566,8 @@ class OllamaChat:
         # Reset per-turn budget counters
         self._thinking_calls = 0
         self._empty_lookups = 0
+        self._round_timings = []
+        self._col = 2  # Start indented (after "  " prefix printed by caller)
 
         # Proving Ground: start tracking this task
         self._current_task_id = tracker.start_task(user_input, OLLAMA_MODEL)
@@ -426,20 +577,34 @@ class OllamaChat:
             if round_num > 0:
                 remaining = MAX_TOOL_ROUNDS - round_num
                 budget_color = C_GREEN if remaining > 4 else (C_YELLOW if remaining > 2 else C_RED)
-                print(f"\n{C_PURPLE}{DIAMOND}{C_RESET} {budget_color}{C_DIM}[{remaining} rounds left]{C_RESET} ", end="", flush=True)
+                print(f"\n{C_PURPLE}{DIAMOND}{C_RESET} {budget_color}{C_DIM}[{remaining} rounds left]{C_RESET}\n  ", end="", flush=True)
+                self._col = 2
 
             try:
+                infer_start = time.monotonic()
                 response = await self._stream_to_ollama()
+                infer_end = time.monotonic()
             except KeyboardInterrupt:
                 print(f"\n{C_MUTED}  {DIAMOND_SM} stream interrupted{C_RESET}")
+                agg = self._aggregate_timing()
                 if self._current_task_id is not None:
                     tracker.complete_task(self._current_task_id, "interrupted", round_num)
+                    self._session_logger.log_task_outcome(
+                        self._current_task_id, "interrupted", round_num + 1, agg)
                 return "[interrupted]"
 
             if response is None:
+                agg = self._aggregate_timing()
                 if self._current_task_id is not None:
                     tracker.complete_task(self._current_task_id, "failed", round_num)
-                return "[Error: no response from Ollama]"
+                    self._session_logger.log_task_outcome(
+                        self._current_task_id, "failed", round_num + 1, agg)
+                backend_name = "vllm-mlx" if self._backend == "vllm-mlx" else "Ollama"
+                return f"[Error: no response from {backend_name}]"
+
+            # Capture timing metadata from the stream
+            timing = response.pop("_timing", {})
+            timing["total"] = infer_end - infer_start
 
             message = response.get("message", {})
             tool_calls = message.get("tool_calls")
@@ -458,14 +623,25 @@ class OllamaChat:
                 content = message.get("content", "")
                 self._messages.append({"role": "assistant", "content": content})
                 self._session_logger.log("assistant", content)
+                self._session_logger.log_timing(round_num, timing)
                 print()  # Newline after streamed output
-                # Proving Ground: mark task complete
+                # Show timing summary
+                self._round_timings.append(timing)
+                self._print_timing_summary()
+                self._turn_separator()
+                # Log task outcome with aggregate timing
+                agg = self._aggregate_timing()
                 if self._current_task_id is not None:
                     tracker.complete_task(self._current_task_id, "completed", round_num)
+                    self._session_logger.log_task_outcome(
+                        self._current_task_id, "completed", round_num + 1, agg)
                 return content
 
             # Tool calls detected -- newline after any streamed preamble text
             print()
+            self._round_timings.append(timing)
+            self._session_logger.log_timing(round_num, timing)
+            tool_exec_start = time.monotonic()
 
             # Append the assistant message with tool_calls to history
             self._messages.append({
@@ -492,7 +668,7 @@ class OllamaChat:
                 if tool_name == "sequentialthinking":
                     self._thinking_calls += 1
                     if self._thinking_calls > MAX_THINKING_CALLS:
-                        print(f"  {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}capped ({MAX_THINKING_CALLS} max) — produce your answer now{C_RESET}")
+                        print(f"    {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}capped ({MAX_THINKING_CALLS} max) — produce your answer now{C_RESET}")
                         result = (
                             f"BUDGET: You have used {MAX_THINKING_CALLS} thinking rounds. "
                             f"Stop thinking and produce your final answer directly. "
@@ -501,10 +677,10 @@ class OllamaChat:
                         self._messages.append({"role": "tool", "content": result})
                         continue
 
-                # Cap repeated empty knowledge lookups
-                if tool_name == "lookup_knowledge":
+                # Cap repeated empty knowledge/search lookups
+                if tool_name in ("lookup_knowledge", "search"):
                     if self._empty_lookups >= MAX_EMPTY_LOOKUPS:
-                        print(f"  {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}skipped — knowledge base is sparse, proceed without{C_RESET}")
+                        print(f"    {C_YELLOW}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_YELLOW}skipped — knowledge base is sparse, proceed without{C_RESET}")
                         result = (
                             "BUDGET: The knowledge base has limited entries. "
                             "Stop searching and answer from your own knowledge. "
@@ -516,15 +692,17 @@ class OllamaChat:
                 # Print tool call — human-readable
                 summary = _tool_args_summary(tool_args)
                 if summary:
-                    print(f"  {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_MUTED}{summary}{C_RESET}")
+                    print(f"    {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}  {C_MUTED}{summary}{C_RESET}")
                 else:
-                    print(f"  {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}")
+                    print(f"    {C_CYAN}{ARROW_R} {C_WHITE}{tool_name}{C_RESET}")
 
                 # Execute the tool
                 result = await self._tool_manager.call_tool(tool_name, tool_args)
 
-                # Track empty knowledge lookups
-                if tool_name == "lookup_knowledge" and "No knowledge found" in result:
+                # Track empty knowledge/search lookups
+                if tool_name in ("lookup_knowledge", "search") and (
+                    "No knowledge found" in result or "No results found" in result
+                ):
                     self._empty_lookups += 1
 
                 # Inject budget warning when rounds are running low
@@ -563,63 +741,151 @@ class OllamaChat:
                     "content": result,
                 })
 
+            # Track tool execution time for this round
+            tool_exec_end = time.monotonic()
+            if self._round_timings:
+                self._round_timings[-1]["tool_exec"] = tool_exec_end - tool_exec_start
+
         # Proving Ground: mark task as failed (too many rounds)
+        agg = self._aggregate_timing()
         if self._current_task_id is not None:
             tracker.complete_task(self._current_task_id, "failed", MAX_TOOL_ROUNDS)
+            self._session_logger.log_task_outcome(
+                self._current_task_id, "exhausted", MAX_TOOL_ROUNDS, agg)
+        self._print_timing_summary()
+        self._turn_separator()
         return "[Error: max tool call rounds exceeded]"
 
-    def _build_payload(self, *, stream: bool) -> dict[str, Any]:
-        """Build the Ollama /api/chat payload."""
-        payload: dict[str, Any] = {
-            "model": OLLAMA_MODEL,
-            "messages": self._build_messages(),
-            "stream": stream,
-            "options": {
-                "num_ctx": NUM_CTX,
-            },
+    def _aggregate_timing(self) -> dict:
+        """Aggregate timing data across all rounds for logging."""
+        total_tokens = sum(t.get("tokens", 0) for t in self._round_timings)
+        total_gen = sum(t.get("gen", 0) for t in self._round_timings)
+        total_time = sum(t.get("total", 0) for t in self._round_timings)
+        return {
+            "tokens": total_tokens,
+            "gen": total_gen,
+            "total": total_time,
+            "tok_per_sec": total_tokens / total_gen if total_gen > 0 else 0,
         }
-        if self._tool_manager.ollama_tools:
+
+    def _print_timing_summary(self):
+        """Print a compact timing summary after task completion."""
+        if not self._round_timings:
+            return
+        total_infer = sum(t.get("total", 0) for t in self._round_timings)
+        total_ttft = sum(t.get("ttft", 0) for t in self._round_timings)
+        total_gen = sum(t.get("gen", 0) for t in self._round_timings)
+        total_tool = sum(t.get("tool_exec", 0) for t in self._round_timings)
+        total_tokens = sum(t.get("tokens", 0) for t in self._round_timings)
+        rounds = len(self._round_timings)
+
+        parts = []
+        if total_tokens > 0 and total_gen > 0:
+            tps = total_tokens / total_gen
+            parts.append(f"{tps:.0f} tok/s")
+        if total_ttft > 0:
+            parts.append(f"ttft {total_ttft*1000:.0f}ms")
+        if total_gen > 0:
+            parts.append(f"gen {total_gen:.1f}s")
+        if total_tool > 0:
+            parts.append(f"tools {total_tool:.1f}s")
+        if rounds > 1:
+            parts.append(f"{rounds} rounds")
+        parts.append(f"total {total_infer + total_tool:.1f}s")
+
+        if parts:
+            summary = " · ".join(parts)
+            print(f"    {C_MUTED}{DIAMOND_SM} {summary}{C_RESET}")
+
+    def _build_payload(self, *, stream: bool) -> dict[str, Any]:
+        """Build the inference payload for the active backend."""
+        messages = self._build_messages()
+        enable_thinking = self._plan_mode  # Think in plan mode, not in chat mode
+
+        if self._backend == "vllm-mlx":
+            payload: dict[str, Any] = {
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": stream,
+                "max_tokens": VLLM_MAX_PLAN_TOKENS if self._plan_mode else VLLM_MAX_TOKENS,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            }
+        else:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": stream,
+                "think": enable_thinking,
+                "options": {
+                    "num_ctx": NUM_CTX,
+                },
+            }
+
+        # No tools in plan mode — pure reasoning only
+        if not self._plan_mode and self._tool_manager.ollama_tools:
             payload["tools"] = self._tool_manager.ollama_tools
         return payload
 
     async def _send_to_ollama(self) -> dict | None:
-        """Send the current conversation to Ollama /api/chat (non-streaming)."""
+        """Send non-streaming request to the active backend."""
         payload = self._build_payload(stream=False)
+        endpoint = "/v1/chat/completions" if self._backend == "vllm-mlx" else "/api/chat"
+        backend_name = "vllm-mlx" if self._backend == "vllm-mlx" else "Ollama"
+        base_url = VLLM_URL if self._backend == "vllm-mlx" else OLLAMA_URL
 
         try:
-            resp = await self._http.post("/api/chat", json=payload)
+            resp = await self._http.post(endpoint, json=payload)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if self._backend == "vllm-mlx":
+                # Normalize OpenAI format to our internal format
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                tool_calls = None
+                if msg.get("tool_calls"):
+                    tool_calls = [
+                        {"function": {"name": tc["function"]["name"],
+                                      "arguments": tc["function"].get("arguments", {})}}
+                        for tc in msg["tool_calls"]
+                    ]
+                result = {"message": {"content": msg.get("content", "") or ""}, "_timing": {}}
+                if tool_calls:
+                    result["message"]["tool_calls"] = tool_calls
+                return result
+            return data
         except httpx.TimeoutException:
-            print(f"  {C_RED}{DOT} Ollama request timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            print(f"  {C_RED}{DOT} {backend_name} request timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
             return None
         except httpx.HTTPStatusError as e:
-            print(f"  {C_RED}{DOT} Ollama HTTP {e.response.status_code}: {e.response.text[:200]}{C_RESET}")
+            print(f"  {C_RED}{DOT} {backend_name} HTTP {e.response.status_code}: {e.response.text[:200]}{C_RESET}")
             return None
         except httpx.ConnectError:
-            print(f"  {C_RED}{DOT} Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
+            print(f"  {C_RED}{DOT} Cannot connect to {backend_name} at {base_url}{C_RESET}")
             return None
         except Exception as e:
-            print(f"  {C_RED}{DOT} Ollama request failed: {e}{C_RESET}")
+            print(f"  {C_RED}{DOT} {backend_name} request failed: {e}{C_RESET}")
             return None
 
     async def _stream_to_ollama(self) -> dict | None:
-        """Stream a response from Ollama /api/chat, printing tokens as they arrive.
+        """Stream a response from the active backend, printing tokens as they arrive.
 
-        Ollama streaming sends one JSON object per line. Each chunk has:
-          - message.content: text fragment (may be empty)
-          - message.tool_calls: present only on the final chunk when tools are invoked
-          - done: true on the final chunk
-
-        Returns a response dict in the same format as non-streaming (with a
-        synthesized "message" key), or None on failure.
+        Returns a response dict with "message" key and "_timing" metadata.
         Falls back to non-streaming if the stream connection fails.
         """
+        if self._backend == "vllm-mlx":
+            return await self._stream_vllm()
+        return await self._stream_ollama()
+
+    async def _stream_ollama(self) -> dict | None:
+        """Stream from Ollama /api/chat (NDJSON format)."""
         payload = self._build_payload(stream=True)
 
         content_parts: list[str] = []
         tool_calls: list[dict] | None = None
         final_chunk: dict = {}
+        first_token_time: float | None = None
+        stream_start = time.monotonic()
+        token_count = 0
 
         try:
             async with self._http.stream("POST", "/api/chat", json=payload) as resp:
@@ -637,8 +903,11 @@ class OllamaChat:
                     # Print text fragments as they arrive
                     fragment = msg.get("content", "")
                     if fragment:
-                        print(fragment, end="", flush=True)
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        self._print_fragment(fragment)
                         content_parts.append(fragment)
+                        token_count += 1  # approximation: one chunk ~ one token
 
                     # Accumulate tool_calls (Ollama sends them on the final chunk)
                     if msg.get("tool_calls"):
@@ -663,6 +932,8 @@ class OllamaChat:
             print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
 
+        stream_end = time.monotonic()
+
         # Assemble the response in the same shape as non-streaming
         assembled_message: dict[str, Any] = {
             "content": "".join(content_parts),
@@ -672,7 +943,123 @@ class OllamaChat:
 
         result = dict(final_chunk)
         result["message"] = assembled_message
+        result["_timing"] = {
+            "ttft": (first_token_time - stream_start) if first_token_time else 0,
+            "gen": (stream_end - first_token_time) if first_token_time else 0,
+            "tokens": token_count,
+        }
         return result
+
+    async def _stream_vllm(self) -> dict | None:
+        """Stream from vllm-mlx /v1/chat/completions (SSE format).
+
+        Handles OpenAI-style streaming: data: {json} lines, data: [DONE] at end.
+        Tool calls may arrive as deltas across multiple chunks.
+        """
+        payload = self._build_payload(stream=True)
+
+        content_parts: list[str] = []
+        tool_calls_accum: dict[int, dict] = {}  # index -> {id, name, arguments_parts}
+        first_token_time: float | None = None
+        stream_start = time.monotonic()
+        token_count = 0
+
+        try:
+            async with self._http.stream("POST", "/v1/chat/completions", json=payload) as resp:
+                resp.raise_for_status()
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices")
+                    if not choices:
+                        continue  # vllm-mlx may send chunks with choices: null
+                    delta = choices[0].get("delta", {})
+
+                    # Text content (vllm-mlx sends content: null, not missing)
+                    fragment = delta.get("content") or ""
+                    if fragment:
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        self._print_fragment(fragment)
+                        content_parts.append(fragment)
+                        token_count += 1
+
+                    # Tool calls (may arrive as deltas across multiple chunks)
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_accum:
+                            if first_token_time is None:
+                                first_token_time = time.monotonic()
+                            tool_calls_accum[idx] = {
+                                "id": tc.get("id", ""),
+                                "name": "",
+                                "arguments_parts": [],
+                            }
+                        func = tc.get("function", {})
+                        if func.get("name"):
+                            tool_calls_accum[idx]["name"] = func["name"]
+                        if func.get("arguments"):
+                            tool_calls_accum[idx]["arguments_parts"].append(func["arguments"])
+
+        except httpx.TimeoutException:
+            print(f"\n  {C_RED}{DOT} vllm-mlx stream timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            return None
+        except httpx.HTTPStatusError as e:
+            print(f"\n  {C_RED}{DOT} vllm-mlx HTTP {e.response.status_code}{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
+            return await self._send_to_ollama()
+        except httpx.ConnectError:
+            print(f"  {C_RED}{DOT} Cannot connect to vllm-mlx at {VLLM_URL}{C_RESET}")
+            return None
+        except Exception as e:
+            print(f"\n  {C_RED}{DOT} Stream failed: {e}{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
+            return await self._send_to_ollama()
+
+        stream_end = time.monotonic()
+
+        # Assemble tool_calls from accumulated deltas
+        assembled_tool_calls = None
+        if tool_calls_accum:
+            assembled_tool_calls = []
+            for idx in sorted(tool_calls_accum.keys()):
+                tc = tool_calls_accum[idx]
+                args_str = "".join(tc["arguments_parts"])
+                try:
+                    args = json.loads(args_str)
+                except json.JSONDecodeError:
+                    args = {}
+                assembled_tool_calls.append({
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": args,
+                    }
+                })
+
+        assembled_message: dict[str, Any] = {
+            "content": "".join(content_parts),
+        }
+        if assembled_tool_calls:
+            assembled_message["tool_calls"] = assembled_tool_calls
+
+        return {
+            "message": assembled_message,
+            "done": True,
+            "_timing": {
+                "ttft": (first_token_time - stream_start) if first_token_time else 0,
+                "gen": (stream_end - first_token_time) if first_token_time else 0,
+                "tokens": token_count,
+            },
+        }
 
     def _estimate_tokens(self, messages: list[dict]) -> int:
         """Rough token estimate: 4 chars ~ 1 token."""
@@ -680,7 +1067,18 @@ class OllamaChat:
 
     def _build_messages(self) -> list[dict]:
         """Build the message list, trimming old messages if over budget."""
-        messages = [{"role": "system", "content": self._system_prompt}]
+        if self._plan_mode:
+            system_content = PLANNING_PROMPT
+            if self._backend == "vllm-mlx":
+                system_content = "/think\n" + system_content
+        else:
+            system_content = self._system_prompt
+            if self._backend == "vllm-mlx":
+                # Qwen3 enables thinking by default. /no_think in the system prompt
+                # is the reliable way to disable it (chat_template_kwargs alone is
+                # not sufficient for streaming requests).
+                system_content = "/no_think\n" + system_content
+        messages = [{"role": "system", "content": system_content}]
 
         # Trim from front if over budget
         history = list(self._messages)
@@ -708,13 +1106,15 @@ class OllamaChat:
 # CLI interface
 # ---------------------------------------------------------------------------
 
-def print_banner(tool_manager: MCPToolManager, ollama_version: str = ""):
+def print_banner(tool_manager: MCPToolManager, backend_version: str = "",
+                 backend: str = "ollama"):
     """Print startup banner — everything in one clean box."""
     print(proving_ground.render_compact(
-        OLLAMA_MODEL,
-        ollama_version=ollama_version,
+        friendly_model_name(OLLAMA_MODEL),
+        ollama_version=backend_version,
         tool_count=len(tool_manager.tool_names),
         server_count=len(tool_manager._clients),
+        backend=backend,
     ))
     print()
 
@@ -724,7 +1124,7 @@ def _setup_readline():
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
         readline.read_history_file(str(HISTORY_FILE))
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError):
         pass
     readline.set_history_length(1000)
     # Tab-complete slash commands
@@ -748,15 +1148,17 @@ def _save_readline():
 
 async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                            session_logger: SessionLogger,
-                           ollama_version: str = ""):
+                           backend_version: str = "", backend: str = "ollama"):
     """Run the interactive input loop."""
     _setup_readline()
-    print_banner(tool_manager, ollama_version)
+    print_banner(tool_manager, backend_version, backend)
 
     while True:
         try:
+            mode_hint = f" \x01{C_YELLOW}\x02[plan]\x01{C_RESET}\x02" if chat._plan_mode else ""
+            prompt_str = f"\x01{C_WHITE}{C_BOLD}\x02You\x01{C_RESET}\x02{mode_hint} \x01{C_CYAN}\x02{ARROW_R}\x01{C_RESET}\x02 "
             user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(f"{C_CYAN}{ARROW_R}{C_RESET} ")
+                None, lambda: input(prompt_str)
             )
         except (EOFError, KeyboardInterrupt):
             print()
@@ -775,6 +1177,23 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 chat.reset()
                 print(f"  {C_MUTED}{DIAMOND_SM} conversation cleared{C_RESET}")
                 continue
+            elif cmd == "/plan":
+                if chat._plan_mode:
+                    print(f"  {C_MUTED}{DIAMOND_SM} already in plan mode. /build to switch to execution{C_RESET}")
+                else:
+                    chat._plan_mode = True
+                    chat.reset()
+                    print(f"  {C_YELLOW}{C_BOLD}{DIAMOND} Plan mode{C_RESET} {C_MUTED}— thinking enabled, tools disabled{C_RESET}")
+                    print(f"  {C_MUTED}{DIAMOND_SM} discuss your approach, then /build to execute{C_RESET}")
+                continue
+            elif cmd == "/build":
+                if not chat._plan_mode:
+                    print(f"  {C_MUTED}{DIAMOND_SM} not in plan mode. /plan to start planning{C_RESET}")
+                else:
+                    chat._plan_mode = False
+                    chat.reset()
+                    print(f"  {C_GREEN}{C_BOLD}{DIAMOND} Build mode{C_RESET} {C_MUTED}— tools enabled, ready to execute{C_RESET}")
+                continue
             elif cmd == "/tools":
                 if tool_manager.tool_names:
                     for name in sorted(tool_manager.tool_names):
@@ -792,9 +1211,10 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 task_id = tracker.get_last_task_id()
                 if task_id is None:
                     print(f"  {C_MUTED}{DIAMOND_SM} No tasks to rate{C_RESET}")
-                elif len(parts) == 2 and parts[1].isdigit():
+                elif len(parts) == 2 and parts[1].isdigit() and 1 <= int(parts[1]) <= 5:
                     rating = int(parts[1])
                     tracker.rate_task(task_id, rating)
+                    session_logger.log("rating", "", task_id=task_id, rating=rating)
                     stars = "★" * rating + "☆" * (5 - rating)
                     print(f"  {C_YELLOW}{stars}{C_RESET} {C_MUTED}task #{task_id}{C_RESET}")
                 else:
@@ -804,6 +1224,7 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 task_id = tracker.get_last_task_id()
                 if task_id:
                     tracker.mark_override(task_id)
+                    session_logger.log("override", "", task_id=task_id)
                     print(f"  {C_YELLOW}{DIAMOND_SM}{C_RESET} {C_MUTED}Task #{task_id} marked as overridden{C_RESET}")
                 else:
                     print(f"  {C_MUTED}{DIAMOND_SM} No tasks to mark{C_RESET}")
@@ -823,10 +1244,10 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                     print(f"  {C_MUTED}{DIAMOND_SM} Usage: /knowledge <query>{C_RESET}")
                 else:
                     query = parts[1]
-                    result = await tool_manager.call_tool("lookup_knowledge", {"query": query})
+                    result = await tool_manager.call_tool("search", {"query": query, "scope": "knowledge"})
                     if result.startswith("Error:") or result.startswith("Tool error:"):
                         print(f"  {C_RED}{DOT} {result}{C_RESET}")
-                    elif "No knowledge found" in result:
+                    elif "No results found" in result or "No knowledge found" in result:
                         print(f"  {C_MUTED}{DIAMOND_SM} No knowledge found for '{query}'{C_RESET}")
                     else:
                         print(f"  {C_GREEN}{DOT}{C_RESET} {result[:500]}")
@@ -854,18 +1275,28 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
             elif cmd.startswith("/model"):
                 parts = user_input.split(maxsplit=1)
                 if len(parts) < 2:
-                    print(f"  {C_WHITE}{OLLAMA_MODEL}{C_RESET}")
-                    # List available models
+                    backend_label = f" {C_MUTED}via {chat._backend}{C_RESET}"
+                    print(f"  {C_WHITE}{friendly_model_name(OLLAMA_MODEL)}{C_RESET}{backend_label}")
+                    # List available models from the active backend
                     try:
                         async with httpx.AsyncClient(timeout=5.0) as http:
-                            resp = await http.get(f"{OLLAMA_URL}/api/tags")
-                            resp.raise_for_status()
-                            models = resp.json().get("models", [])
-                            for m in models[:10]:
-                                name = m.get("name", "?")
-                                size = m.get("size", 0) / 1e9
-                                mark = f"{C_GREEN}{DOT}{C_RESET}" if name == OLLAMA_MODEL else f"{C_MUTED}{DIAMOND_SM}{C_RESET}"
-                                print(f"  {mark} {C_WHITE}{name}{C_RESET} {C_MUTED}{size:.1f}GB{C_RESET}")
+                            if chat._backend == "vllm-mlx":
+                                resp = await http.get(f"{VLLM_URL}/v1/models")
+                                resp.raise_for_status()
+                                models = resp.json().get("data", [])
+                                for m in models[:10]:
+                                    name = m.get("id", "?")
+                                    mark = f"{C_GREEN}{DOT}{C_RESET}" if name == OLLAMA_MODEL else f"{C_MUTED}{DIAMOND_SM}{C_RESET}"
+                                    print(f"  {mark} {C_WHITE}{friendly_model_name(name)}{C_RESET} {C_MUTED}(vllm-mlx){C_RESET}")
+                            else:
+                                resp = await http.get(f"{OLLAMA_URL}/api/tags")
+                                resp.raise_for_status()
+                                models = resp.json().get("models", [])
+                                for m in models[:10]:
+                                    name = m.get("name", "?")
+                                    size = m.get("size", 0) / 1e9
+                                    mark = f"{C_GREEN}{DOT}{C_RESET}" if name == OLLAMA_MODEL else f"{C_MUTED}{DIAMOND_SM}{C_RESET}"
+                                    print(f"  {mark} {C_WHITE}{name}{C_RESET} {C_MUTED}{size:.1f}GB{C_RESET}")
                     except Exception:
                         pass
                 else:
@@ -892,6 +1323,10 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 print(f"  {C_WHITE}/tools{C_RESET}      {C_MUTED}─ List MCP tools{C_RESET}")
                 print(f"  {C_WHITE}/knowledge{C_RESET}  {C_MUTED}─ Query knowledge base{C_RESET}")
                 print()
+                print(f"  {C_BOLD}{C_WHITE}Modes{C_RESET}")
+                print(f"  {C_WHITE}/plan{C_RESET}       {C_MUTED}─ Plan mode (thinking on, tools off){C_RESET}")
+                print(f"  {C_WHITE}/build{C_RESET}      {C_MUTED}─ Build mode (tools on, execute plan){C_RESET}")
+                print()
                 print(f"  {C_BOLD}{C_WHITE}Proving Ground{C_RESET}")
                 print(f"  {C_WHITE}/stats{C_RESET}      {C_MUTED}─ Full statistics{C_RESET}")
                 print(f"  {C_WHITE}/history{C_RESET}    {C_MUTED}─ Recent tasks{C_RESET}")
@@ -907,7 +1342,9 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 continue
 
         # Send to Purple -- response text streams inline during chat()
-        print(f"{C_PURPLE}{DIAMOND}{C_RESET} ", end="", flush=True)
+        mode_label = f" {C_YELLOW}[planning]{C_RESET}" if chat._plan_mode else ""
+        print(f"\n{C_PURPLE}{C_BOLD}Purple{C_RESET}{mode_label} {C_PURPLE}{DIAMOND}{C_RESET}")
+        print(f"  ", end="", flush=True)
         try:
             await chat.chat(user_input)
             # chat() already printed the streamed text and a trailing newline
@@ -928,6 +1365,22 @@ async def one_shot(chat: OllamaChat, prompt: str):
 # Main
 # ---------------------------------------------------------------------------
 
+async def _check_vllm() -> tuple[bool, str, str]:
+    """Check if vllm-mlx is reachable. Returns (healthy, model_id, version)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{VLLM_URL}/v1/models")
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data", [])
+            if models:
+                model_id = models[0].get("id", "unknown")
+                return True, model_id, "vllm-mlx"
+            return True, "", "vllm-mlx"
+    except Exception:
+        return False, "", ""
+
+
 async def _check_ollama() -> tuple[bool, str]:
     """Verify Ollama is reachable. Returns (healthy, version_string)."""
     try:
@@ -945,28 +1398,64 @@ async def _check_ollama() -> tuple[bool, str]:
         return True, ""  # Proceed anyway -- might still work
 
 
+async def _detect_backend() -> tuple[str, str, str]:
+    """Auto-detect the best available backend.
+
+    Returns (backend, model_name, version_string).
+    backend is "" if no backend is available.
+    Priority: vllm-mlx (if running with a model loaded) > Ollama.
+    """
+    global OLLAMA_MODEL
+
+    # Try vllm-mlx if requested or auto-detecting
+    if PURPLE_BACKEND in ("vllm-mlx", "auto"):
+        healthy, model_id, ver = await _check_vllm()
+        if healthy:
+            # Auto-detect requires a model loaded; forced mode accepts empty
+            if model_id or PURPLE_BACKEND == "vllm-mlx":
+                if model_id:
+                    OLLAMA_MODEL = model_id
+                return "vllm-mlx", OLLAMA_MODEL, ver
+        elif PURPLE_BACKEND == "vllm-mlx":
+            print(f"  {C_RED}{DOT} vllm-mlx not available at {VLLM_URL}{C_RESET}")
+
+    # Fall back to Ollama (or it was explicitly requested)
+    healthy, ver = await _check_ollama()
+    if not healthy:
+        return "", OLLAMA_MODEL, ""
+    return "ollama", OLLAMA_MODEL, ver
+
+
 async def main():
     tool_manager = MCPToolManager()
     session_logger = SessionLogger()
     chat = None
-    ollama_version = ""
+    backend_version = ""
 
     # Initialize Proving Ground tracker
     tracker.init_db()
-    if tracker.check_model_change(OLLAMA_MODEL):
-        print(f"  {C_YELLOW}{DIAMOND_SM} Model changed — tier reset to T0 (Candidate){C_RESET}")
 
     try:
-        # Verify Ollama is reachable
-        healthy, ollama_version = await _check_ollama()
-        if not healthy:
+        # Detect backend (auto: vllm-mlx if available, else Ollama)
+        backend, model_name, backend_version = await _detect_backend()
+        if not backend:
             return
+
+        if tracker.check_model_change(OLLAMA_MODEL):
+            print(f"  {C_YELLOW}{DIAMOND_SM} Model changed — tier reset to T0 (Candidate){C_RESET}")
 
         # Connect to MCP servers (silent — results shown in banner)
         await tool_manager.connect()
 
+        # Log session metadata for verification/fine-tuning pipeline
+        session_logger.log_session_meta(
+            model=OLLAMA_MODEL, backend=backend,
+            tier=tracker.get_current_tier(),
+            tool_count=len(tool_manager.tool_names),
+            server_count=len(tool_manager._clients))
+
         # Create chat client
-        chat = OllamaChat(tool_manager, session_logger)
+        chat = OllamaChat(tool_manager, session_logger, backend=backend)
 
         if len(sys.argv) > 1:
             # One-shot mode: join all args as prompt
@@ -974,7 +1463,8 @@ async def main():
             await one_shot(chat, prompt)
         else:
             # Interactive mode
-            await interactive_loop(chat, tool_manager, session_logger, ollama_version)
+            await interactive_loop(chat, tool_manager, session_logger,
+                                   backend_version, backend)
 
     except KeyboardInterrupt:
         pass

@@ -125,7 +125,8 @@ def _sovereignty_bar(score: int, width: int = 20) -> str:
 
 
 def render_compact(model: str, *, ollama_version: str = "",
-                   tool_count: int = 0, server_count: int = 0) -> str:
+                   tool_count: int = 0, server_count: int = 0,
+                   backend: str = "ollama") -> str:
     """Render the compact startup dashboard — one unified box."""
     tier = tracker.get_current_tier()
     tier_name = tracker.TIER_NAMES.get(tier, "Unknown")
@@ -138,8 +139,13 @@ def render_compact(model: str, *, ollama_version: str = "",
     # ── Single unified box ──
     lines.append(_box_top(f"{DIAMOND} Purple CLI", W))
 
-    # Model + Ollama version
-    ver = f" {C_MUTED}· Ollama v{ollama_version}{C_RESET}" if ollama_version else ""
+    # Model + backend info
+    if backend == "vllm-mlx":
+        ver = f" {C_MUTED}· vllm-mlx{C_RESET}"
+    elif ollama_version:
+        ver = f" {C_MUTED}· Ollama v{ollama_version}{C_RESET}"
+    else:
+        ver = ""
     lines.append(_box_row(f"{C_WHITE}{model}{C_RESET}{ver}", W))
 
     # Tools/servers summary

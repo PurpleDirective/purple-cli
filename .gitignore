@@ -40,7 +40,24 @@ teaching/compiled/*
 teaching/audit/*
 teaching/verify/*
 teaching/finetune/*
+teaching/transcripts/
 !teaching/**/.gitkeep
+
+# Eval results (code ships, data stays local)
+eval/*-results*/
+eval/frontier/
+eval/v6-comparison-*/
+eval/bcb-results/
+eval/evalplus-results/
+eval/log.csv
+
+# Runtime artifacts
+hooks/hook.log
+*.db-shm
+*.db-wal
+
+# Retired server backups
+*.retired
 
 # Demo source (keep generated outputs)
 demo.tape

@@ -312,7 +312,7 @@ class TestEstimateTokens:
         mgr.ollama_tools = []
         with patch("purple.load_identity", return_value="test system prompt"):
             with patch("purple.httpx.AsyncClient"):
-                chat = OllamaChat(mgr)
+                chat = OllamaChat(mgr, MagicMock())
         return chat
 
     def test_empty_messages(self):
@@ -385,7 +385,7 @@ class TestBuildMessages:
         mgr.ollama_tools = []
         with patch("purple.load_identity", return_value=system_prompt):
             with patch("purple.httpx.AsyncClient"):
-                chat = OllamaChat(mgr)
+                chat = OllamaChat(mgr, MagicMock())
         return chat
 
     def test_empty_history(self):

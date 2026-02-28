@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────
+# Vega v1 Training Config
+# Fine-tunes Qwen3.5-27B with QLoRA for identity, domain expertise,
+# and personality alignment.
+#
+# Confirm model_id at: https://huggingface.co/Qwen
+# ─────────────────────────────────────────────────────────────────
+
+# Model
+# Note: No separate BASE variant exists for 27B — this is the post-trained (instruct) model.
+# Strategy: fine-tune this → abliterate the fine-tuned checkpoint (NOT before)
+model_id: "Qwen/Qwen3.5-27B"
+adapter_name: "vega-v2"
+output_dir: "/home/purple/.purple/adapters/vega-v2"
+
+# Data
+train_data: "/home/purple/.purple/book-to-brain/training-data/training_v2.jsonl"
+val_split: 0.05                        # 5% held out for validation loss
+shuffle_seed: 42
+
+# QLoRA (fits in 32GB VRAM with 27B model)
+load_in_4bit: true
+bnb_4bit_compute_dtype: "bfloat16"    # RTX 5090 has bfloat16 hardware support
+bnb_4bit_quant_type: "nf4"            # NormalFloat4 — better than fp4 for LLMs
+bnb_4bit_use_double_quant: true       # saves ~0.4 bits/param additional
+
+# LoRA — DeltaNet-aware target_modules (CRITICAL for Qwen3.5)
+# Qwen3.5 is a linear attention hybrid: 48 linear_attn + 16 full_attn layers
+# Default Unsloth target_modules only cover 16/64 attention layers
+# This config covers all 64 layers
+lora_r: 16
+lora_alpha: 32                         # alpha=2r recommended for personality work
+lora_dropout: 0.05
+bias: "none"
+target_modules:
+  # Full attention layers (16/64 layers — every 4th starting at layer 3)
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  # MLP layers (ALL 64 layers — same names throughout)
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+  # Linear attention layers (48/64 layers — layers 0,1,2 of each 4-layer block)
+  - "in_proj_qkv"                      # fused QKV projection
+  - "in_proj_a"                        # A projection
+  - "in_proj_b"                        # B projection
+  - "in_proj_z"                        # Z (gating) projection
+  - "out_proj"                         # output projection
+
+# Training hyperparameters (Improvement-verified)
+num_train_epochs: 2
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1         # must match train — logits.float() at eval = 8x spike OOM
+gradient_accumulation_steps: 16       # effective batch size = 16 (halved batch, doubled accum)
+learning_rate: 0.0002                  # 2e-4
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.05
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: "adamw_8bit"                    # 8-bit Adam — saves ~75% optimizer memory
+
+# Sequence length
+max_seq_length: 2048                   # covers 95%+ of pairs; 4096 OOMs on 32GB
+
+# Logging and checkpointing
+logging_steps: 10
+eval_steps: 100
+save_steps: 200
+save_total_limit: 3                    # keep last 3 checkpoints
+load_best_model_at_end: true
+metric_for_best_model: "eval_loss"
+
+# Performance
+bf16: true                             # RTX 5090 native bfloat16
+tf32: false                            # disabled — PyTorch 2.10 TF32 API conflict with InductorError
+gradient_checkpointing: true           # trades compute for memory
+dataloader_num_workers: 0              # 0 = main process only (avoids CUDA+fork deadlock)
+
+# Reproducibility
+seed: 42

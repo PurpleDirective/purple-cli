@@ -500,7 +500,7 @@ class TestStreamingEdgeCases:
         mgr.ollama_tools = []
         with patch("purple.load_identity", return_value="sys"):
             with patch("purple.httpx.AsyncClient"):
-                chat = OllamaChat(mgr)
+                chat = OllamaChat(mgr, MagicMock())
         return chat
 
     def test_stream_done_true_no_content(self):
@@ -583,7 +583,7 @@ class TestBuildMessagesEdgeCases:
         mgr.ollama_tools = []
         with patch("purple.load_identity", return_value=system_prompt):
             with patch("purple.httpx.AsyncClient"):
-                chat = OllamaChat(mgr)
+                chat = OllamaChat(mgr, MagicMock())
         return chat
 
     def test_all_tool_messages_after_trim_results_in_empty_history(self):
@@ -993,7 +993,7 @@ class TestChatToolRoundLimit:
         mgr.ollama_tools = []
         with patch("purple.load_identity", return_value="sys"):
             with patch("purple.httpx.AsyncClient"):
-                chat = OllamaChat(mgr)
+                chat = OllamaChat(mgr, MagicMock())
         return chat
 
     def test_max_tool_rounds_constant(self):

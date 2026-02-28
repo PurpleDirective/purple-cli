@@ -1,0 +1,19 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: purple-searxng
+    restart: unless-stopped
+    ports:
+      - "8890:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8890/
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"

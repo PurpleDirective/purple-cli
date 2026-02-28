@@ -1,15 +1,15 @@
 {
   "servers": {
-    "purple-memory": {
-      "command": ["python3", "memory/server.py"],
+    "purple-brain": {
+      "command": ["python3", "brain/server.py"],
       "enabled": true
     },
     "purple-docs": {
       "command": ["python3", "docs/server.py"],
       "enabled": true
     },
-    "purple-knowledge": {
-      "command": ["python3", "knowledge/server.py"],
+    "sequential-thinking": {
+      "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
       "enabled": true
     }
   }

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purple-cli"
-version = "0.1.0"
-description = "Local AI agent with native Ollama + MCP tool calling"
+version = "0.3.0"
+description = "Local AI agent with dual inference (Ollama + vllm-mlx) and MCP tool calling"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [

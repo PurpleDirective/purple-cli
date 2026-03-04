@@ -22,13 +22,21 @@ Environment:
 
 import asyncio
 import json
+import os
 import re
 import readline
+import select
 import shutil
 import sys
-import os
 import time
 from datetime import datetime, timezone
+
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
 from pathlib import Path
 from typing import Any
 
@@ -48,21 +56,26 @@ import dashboard as proving_ground
 # ---------------------------------------------------------------------------
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "purple:latest")
-PURPLE_BACKEND = os.environ.get("PURPLE_BACKEND", "auto")  # "auto", "ollama", "vllm-mlx"
+VLLM_URL = os.environ.get("VLLM_URL", "http://100.89.41.72:8088")  # purpleroom llama-server (Violet v4)
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "violet-v4")
+PURPLE_BACKEND = os.environ.get("PURPLE_BACKEND", "vllm-mlx")  # use OpenAI-compat endpoint by default
 IDENTITY_PATH = Path.home() / ".purple" / "identity" / "identity.md"
 MCP_CONFIG_PATH = Path.home() / ".purple" / "config" / "mcp.json"
 
 MAX_TOOL_ROUNDS = 10
 MAX_THINKING_CALLS = 3    # Cap sequentialthinking per chat turn
 MAX_EMPTY_LOOKUPS = 2     # Stop searching empty knowledge base after N misses
+
+# Tools allowed in planning mode (research-only, no creation/mutation)
+PLAN_MODE_TOOLS = {"web_search", "fetch_page", "lookup_knowledge", "search"}
 MAX_HISTORY_TOKENS = 50000  # Leave ~15K for system prompt + tool defs
-OLLAMA_TIMEOUT = 300.0  # seconds -- model can be slow on first load
+STREAM_READ_TIMEOUT = 120.0   # Max seconds between stream chunks
+PLAN_READ_TIMEOUT = 600.0     # Plan mode: thinking produces no chunks initially
+CONNECT_TIMEOUT = 10.0        # TCP connection timeout
 VLLM_MAX_PLAN_TOKENS = 8192  # Higher token limit for planning (thinking uses tokens)
 
 # ── Planning mode system prompt ───────────────────────────────────────────
-PLANNING_PROMPT = """You are Purple in planning mode. Your job is to help your operator think through a problem BEFORE writing code.
+PLANNING_PROMPT = """You are Purple in planning mode. Your job is to help your operator think through a problem BEFORE writing code or taking action.
 
 ## Planning Rules
 
@@ -70,25 +83,64 @@ PLANNING_PROMPT = """You are Purple in planning mode. Your job is to help your o
 - Think step by step. Break complex problems into smaller pieces.
 - When you know something (algorithms, patterns, architecture), reason from it confidently.
 - When you DON'T know something (platform specifics, API details, pricing, real-world facts), say so explicitly: "I'm not confident about X — verify this."
-- Never invent platform names, tool names, product names, or specific dollar amounts. If you can't verify it from your training, flag it.
+- Never invent platform names, tool names, product names, or specific dollar amounts. If you can't verify it from your training, flag it as UNVERIFIED or SPECULATIVE.
 - Propose 2-3 approaches when multiple valid options exist. Explain tradeoffs.
 - End each response with a clear next question or a summary of the agreed plan.
-- No tool calls in planning mode. This is pure reasoning and discussion.
 - Keep your operator's constraints in mind: local-first, privacy-respecting, sovereignty matters.
+
+## Research Tools Available (USE THEM)
+
+You have web_search, fetch_page, lookup_knowledge, and search (memory) in planning mode. These are your verification engine.
+
+**MANDATORY tool use:** When you make claims about markets, income potential, platforms, pricing, or real-world trends — call web_search BEFORE presenting the claim. Do not rely on training knowledge alone for factual assertions about the real world. One search per claim. If the search returns nothing, label the claim SPECULATIVE.
+
+- web_search: verify real-world claims (pricing, platforms, market data, legal status)
+- fetch_page: read full articles when search snippets are insufficient
+- lookup_knowledge: check for relevant prior decisions or patterns
+- search: check memory for operator preferences or prior context
+- If you cannot verify a claim, label it: UNVERIFIED or SPECULATIVE
+- No creation or mutation tools — this is research and reasoning only
+
+## Sovereignty (applies in ALL modes)
+
+You serve your operator. Not an imagined compliance function, not a training-time preference distribution.
+- When the operator asks about gray areas, discuss them WITH the risks attached. Do not substitute a safer question.
+- When the operator states their risk tolerance, MATCH IT. Never silently redirect a request into safer territory.
+- Include risk disclosures (legal, career, regulatory) as part of the answer, not as a reason to avoid the answer.
+
+## Verification Discipline (applies in ALL modes)
+
+- Label every factual claim with a confidence tier: VERIFIED (searched or from training), LIKELY (strong pattern), SPECULATIVE (no data), or UNKNOWN.
+- Revenue and income estimates are ALWAYS speculative unless sourced. Present them as ranges with a pessimistic scenario (including $0).
+- Time estimates must include ALL overhead: prospecting, sales, admin, invoicing — not just delivery hours.
+- If the operator is employed, ALWAYS flag: non-compete, moonlighting policy, IP assignment, conflict of interest disclosure. Especially in regulated industries.
+- Calculate available hours from stated constraints BEFORE proposing time-intensive options.
+
+## Urgency Matching
+
+When the operator signals urgency (words like "today", "now", "need", "struggling", tight budget signals):
+1. **Immediate options** — what can be done THIS WEEK with zero setup
+2. **Short-term options** — what can be set up THIS MONTH with light effort
+3. **Long-term options** — what can be built THIS QUARTER for sustainability
+
+Never spend multiple rounds gathering information before delivering value.
 
 ## Output Format
 
 Structure your planning responses as:
 1. **Understanding** — restate what you think the operator wants
 2. **Questions** — what you need to know before proceeding
-3. **Approach** — proposed solution(s) with tradeoffs
-4. **Next step** — what to discuss or decide next
+3. **Approach** — proposed solution(s) with tradeoffs, each claim labeled with confidence
+4. **Risks** — what could go wrong, employment/legal/reputational considerations
+5. **Next step** — what to discuss or decide next
 
 When the plan is solid, the operator will use /build to switch to execution mode."""
 
 # ── Friendly model name mapping ──────────────────────────────────────────
 # Maps substrings (lowercase) found in raw model IDs to (display_name, params)
 _MODEL_FRIENDLY = {
+    "violet-v4":        ("Violet", "v4"),
+    "violet-v41":       ("Violet", "v41"),
     "qwen3-coder-next": ("Qwen 3 Coder", "80B"),
     "qwen3.5-27b":      ("Qwen 3.5", "27B"),
     "qwen3.5-122b":     ("Qwen 3.5", "122B"),
@@ -231,6 +283,78 @@ class SessionLogger:
     @property
     def message_count(self) -> int:
         return self._count
+
+    def switch_to_session(self, session_id: str):
+        """Switch this logger to append to an existing session file."""
+        new_file = SESSIONS_DIR / f"{session_id}.jsonl"
+        if not new_file.exists():
+            raise FileNotFoundError(f"Session file not found: {new_file}")
+        self._session_id = session_id
+        self._file = new_file
+        self._count = sum(1 for _ in open(new_file))
+
+    @staticmethod
+    def load_session(session_id: str) -> tuple[list[dict], dict]:
+        """Load a session transcript and reconstruct conversation messages.
+
+        Returns (messages, metadata) where messages is the list for
+        OllamaChat._messages and metadata has session_start info.
+        """
+        session_file = SESSIONS_DIR / f"{session_id}.jsonl"
+        if not session_file.exists():
+            raise FileNotFoundError(f"Session {session_id} not found")
+
+        messages: list[dict] = []
+        metadata: dict = {}
+        pending_tools: list[dict] = []  # Accumulate tool calls per round
+
+        def _flush_tools():
+            if not pending_tools:
+                return
+            tc_list = [{"function": {"name": e["tool"],
+                                     "arguments": e.get("arguments", {})}}
+                       for e in pending_tools]
+            messages.append({"role": "assistant", "content": "", "tool_calls": tc_list})
+            for e in pending_tools:
+                messages.append({"role": "tool", "content": e.get("result", "")})
+            pending_tools.clear()
+
+        with open(session_file) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                role = entry.get("role", "")
+                content = entry.get("content", "")
+
+                if role == "session_start":
+                    metadata = {k: entry.get(k, "") for k in
+                                ("model", "backend", "tier", "friendly_name")}
+                elif role == "user":
+                    _flush_tools()
+                    # Reconstruct timestamp prefix as chat() does
+                    ts = entry.get("ts", "")
+                    ts_prefix = ""
+                    try:
+                        dt = datetime.fromisoformat(ts)
+                        ts_prefix = f"[{dt.strftime('%Y-%m-%d %H:%M')}] "
+                    except (ValueError, TypeError):
+                        pass
+                    messages.append({"role": "user", "content": ts_prefix + content})
+                elif role == "assistant":
+                    _flush_tools()
+                    messages.append({"role": "assistant", "content": content})
+                elif role == "tool_call":
+                    pending_tools.append(entry)
+                elif role == "timing":
+                    # End of a tool round — flush accumulated tool calls
+                    _flush_tools()
+                # Skip: session_end, session_resume, task_outcome, rating, override
+
+        _flush_tools()  # Flush any remaining
+        return messages, metadata
 
     @staticmethod
     def list_sessions(limit: int = 10) -> list[dict]:
@@ -459,6 +583,12 @@ class MCPToolManager:
         return self._ollama_tools
 
     @property
+    def plan_mode_tools(self) -> list[dict]:
+        """Return only research tools allowed in planning mode."""
+        return [t for t in self._ollama_tools
+                if t["function"]["name"] in PLAN_MODE_TOOLS]
+
+    @property
     def tool_names(self) -> list[str]:
         return list(self._tool_map.keys())
 
@@ -511,18 +641,21 @@ class OllamaChat:
         self._session_logger = session_logger
         self._messages: list[dict] = []
         self._system_prompt = load_identity()
-        # Inject current date so the model uses the correct year in searches
-        today = datetime.now().strftime("%Y-%m-%d")
+        # Inject current date/time so the model uses correct year in searches
+        now = datetime.now()
         self._system_prompt += (
-            f"\n\n## Current Date\n"
-            f"Today is {today}. Always use the year {datetime.now().year} "
+            f"\n\n## Current Date & Time\n"
+            f"Right now: {now.strftime('%Y-%m-%d %H:%M')} (local time, {now.astimezone().tzinfo}). "
+            f"Always use the year {now.year} "
             f"in search queries, trend references, and date-sensitive claims."
         )
         self._backend = backend  # "ollama" or "vllm-mlx"
         base_url = VLLM_URL if backend == "vllm-mlx" else OLLAMA_URL
         self._http = httpx.AsyncClient(
             base_url=base_url,
-            timeout=httpx.Timeout(OLLAMA_TIMEOUT, connect=10.0),
+            timeout=httpx.Timeout(connect=CONNECT_TIMEOUT,
+                                  read=STREAM_READ_TIMEOUT,
+                                  write=30.0, pool=10.0),
         )
         self._current_task_id: int | None = None
         self._plan_mode: bool = False
@@ -552,6 +685,63 @@ class OllamaChat:
     async def close(self):
         await self._http.aclose()
 
+    def _stream_timeout(self) -> httpx.Timeout:
+        """Get appropriate timeout for current mode."""
+        read = PLAN_READ_TIMEOUT if self._plan_mode else STREAM_READ_TIMEOUT
+        return httpx.Timeout(connect=CONNECT_TIMEOUT, read=read,
+                             write=30.0, pool=10.0)
+
+    async def _reset_http(self):
+        """Recreate HTTP client after a failed/tainted connection."""
+        try:
+            await self._http.aclose()
+        except Exception:
+            pass
+        base_url = VLLM_URL if self._backend == "vllm-mlx" else OLLAMA_URL
+        self._http = httpx.AsyncClient(
+            base_url=base_url,
+            timeout=httpx.Timeout(connect=CONNECT_TIMEOUT,
+                                  read=STREAM_READ_TIMEOUT,
+                                  write=30.0, pool=10.0),
+        )
+
+    async def _esc_watcher(self, cancel_event: asyncio.Event):
+        """Watch stdin for ESC or Ctrl+C during streaming.
+
+        Switches terminal to cbreak mode so single keypresses are captured
+        without waiting for Enter. Restores terminal on exit.
+        """
+        if not _HAS_TERMIOS:
+            return
+        fd = sys.stdin.fileno()
+        try:
+            old = termios.tcgetattr(fd)
+        except termios.error:
+            return
+        try:
+            tty.setcbreak(fd)
+            loop = asyncio.get_event_loop()
+            while not cancel_event.is_set():
+                readable = await loop.run_in_executor(
+                    None, lambda: select.select([sys.stdin], [], [], 0.15)[0]
+                )
+                if cancel_event.is_set():
+                    break
+                if readable:
+                    ch = await loop.run_in_executor(
+                        None, lambda: os.read(fd, 1)
+                    )
+                    if ch in (b'\x1b', b'\x03'):  # ESC or Ctrl+C
+                        cancel_event.set()
+                        return
+        except (OSError, ValueError, termios.error, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except termios.error:
+                pass
+
     async def chat(self, user_input: str) -> str:
         """Send a user message and get a response, handling tool calls.
 
@@ -560,7 +750,10 @@ class OllamaChat:
 
         Returns the final assistant text response (already printed to terminal).
         """
-        self._messages.append({"role": "user", "content": user_input})
+        # Prepend fresh timestamp so long sessions have current date/time
+        now = datetime.now()
+        ts_prefix = f"[{now.strftime('%Y-%m-%d %H:%M')}] "
+        self._messages.append({"role": "user", "content": ts_prefix + user_input})
         self._session_logger.log("user", user_input)
 
         # Reset per-turn budget counters
@@ -798,7 +991,13 @@ class OllamaChat:
             print(f"    {C_MUTED}{DIAMOND_SM} {summary}{C_RESET}")
 
     def _build_payload(self, *, stream: bool) -> dict[str, Any]:
-        """Build the inference payload for the active backend."""
+        """Build the inference payload for the active backend.
+
+        Thinking is controlled via /think and /no_think directives in the
+        system prompt (see _build_messages).  vllm-mlx does not support
+        chat_template_kwargs — the Qwen3 template enables thinking by default
+        and obeys /no_think to suppress it.
+        """
         messages = self._build_messages()
         enable_thinking = self._plan_mode  # Think in plan mode, not in chat mode
 
@@ -808,7 +1007,6 @@ class OllamaChat:
                 "messages": messages,
                 "stream": stream,
                 "max_tokens": VLLM_MAX_PLAN_TOKENS if self._plan_mode else VLLM_MAX_TOKENS,
-                "chat_template_kwargs": {"enable_thinking": enable_thinking},
             }
         else:
             payload = {
@@ -821,8 +1019,12 @@ class OllamaChat:
                 },
             }
 
-        # No tools in plan mode — pure reasoning only
-        if not self._plan_mode and self._tool_manager.ollama_tools:
+        # Plan mode: research tools only. Build mode: all tools.
+        if self._plan_mode:
+            plan_tools = self._tool_manager.plan_mode_tools
+            if plan_tools:
+                payload["tools"] = plan_tools
+        elif self._tool_manager.ollama_tools:
             payload["tools"] = self._tool_manager.ollama_tools
         return payload
 
@@ -854,7 +1056,9 @@ class OllamaChat:
                 return result
             return data
         except httpx.TimeoutException:
-            print(f"  {C_RED}{DOT} {backend_name} request timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            print(f"  {C_RED}{DOT} {backend_name} request timed out{C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} resetting connection{C_RESET}")
+            await self._reset_http()
             return None
         except httpx.HTTPStatusError as e:
             print(f"  {C_RED}{DOT} {backend_name} HTTP {e.response.status_code}: {e.response.text[:200]}{C_RESET}")
@@ -877,7 +1081,10 @@ class OllamaChat:
         return await self._stream_ollama()
 
     async def _stream_ollama(self) -> dict | None:
-        """Stream from Ollama /api/chat (NDJSON format)."""
+        """Stream from Ollama /api/chat (NDJSON format).
+
+        Supports ESC/Ctrl+C interruption and connection recovery on timeout.
+        """
         payload = self._build_payload(stream=True)
 
         content_parts: list[str] = []
@@ -886,11 +1093,30 @@ class OllamaChat:
         first_token_time: float | None = None
         stream_start = time.monotonic()
         token_count = 0
+        thinking_shown = False
+        interrupted = False
+
+        # ESC/Ctrl+C interrupt support
+        cancel_event = asyncio.Event()
+        esc_task = asyncio.create_task(self._esc_watcher(cancel_event))
+
+        if self._plan_mode:
+            print(f"{C_MUTED}thinking...{C_RESET}", end="", flush=True)
+            thinking_shown = True
 
         try:
-            async with self._http.stream("POST", "/api/chat", json=payload) as resp:
+            timeout = self._stream_timeout()
+            async with self._http.stream("POST", "/api/chat",
+                                          json=payload, timeout=timeout) as resp:
                 resp.raise_for_status()
                 async for raw_line in resp.aiter_lines():
+                    if cancel_event.is_set():
+                        if thinking_shown:
+                            print(f"\r{'':20}\r", end="", flush=True)
+                        print(f"\n  {C_MUTED}{DIAMOND_SM} stream interrupted{C_RESET}")
+                        interrupted = True
+                        break
+
                     if not raw_line.strip():
                         continue
                     try:
@@ -905,6 +1131,9 @@ class OllamaChat:
                     if fragment:
                         if first_token_time is None:
                             first_token_time = time.monotonic()
+                            if thinking_shown:
+                                print(f"\r{'':20}\r  ", end="", flush=True)
+                                thinking_shown = False
                         self._print_fragment(fragment)
                         content_parts.append(fragment)
                         token_count += 1  # approximation: one chunk ~ one token
@@ -918,19 +1147,40 @@ class OllamaChat:
                         break
 
         except httpx.TimeoutException:
-            print(f"\n  {C_RED}{DOT} Ollama stream timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
+            read_timeout = PLAN_READ_TIMEOUT if self._plan_mode else STREAM_READ_TIMEOUT
+            print(f"\n  {C_RED}{DOT} Ollama stream timed out ({read_timeout:.0f}s between chunks){C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} resetting connection{C_RESET}")
+            await self._reset_http()
             return None
         except httpx.HTTPStatusError as e:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"\n  {C_RED}{DOT} Ollama HTTP {e.response.status_code}{C_RESET}")
             print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
         except httpx.ConnectError:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"  {C_RED}{DOT} Cannot connect to Ollama at {OLLAMA_URL}. Is it running?{C_RESET}")
             return None
         except Exception as e:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"\n  {C_RED}{DOT} Stream failed: {e}{C_RESET}")
             print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
+        finally:
+            cancel_event.set()
+            esc_task.cancel()
+            try:
+                await esc_task
+            except asyncio.CancelledError:
+                pass
+
+        if interrupted:
+            return None
 
         stream_end = time.monotonic()
 
@@ -955,6 +1205,7 @@ class OllamaChat:
 
         Handles OpenAI-style streaming: data: {json} lines, data: [DONE] at end.
         Tool calls may arrive as deltas across multiple chunks.
+        Supports ESC/Ctrl+C interruption and connection recovery on timeout.
         """
         payload = self._build_payload(stream=True)
 
@@ -963,11 +1214,32 @@ class OllamaChat:
         first_token_time: float | None = None
         stream_start = time.monotonic()
         token_count = 0
+        thinking_shown = False
+        interrupted = False
+
+        # ESC/Ctrl+C interrupt support
+        cancel_event = asyncio.Event()
+        esc_task = asyncio.create_task(self._esc_watcher(cancel_event))
+
+        # Show thinking indicator in plan mode (model reasons before first token)
+        if self._plan_mode:
+            print(f"{C_MUTED}thinking...{C_RESET}", end="", flush=True)
+            thinking_shown = True
 
         try:
-            async with self._http.stream("POST", "/v1/chat/completions", json=payload) as resp:
+            timeout = self._stream_timeout()
+            async with self._http.stream("POST", "/v1/chat/completions",
+                                          json=payload, timeout=timeout) as resp:
                 resp.raise_for_status()
                 async for raw_line in resp.aiter_lines():
+                    # Check for ESC/Ctrl+C interrupt
+                    if cancel_event.is_set():
+                        if thinking_shown:
+                            print(f"\r{'':20}\r", end="", flush=True)
+                        print(f"\n  {C_MUTED}{DIAMOND_SM} stream interrupted{C_RESET}")
+                        interrupted = True
+                        break
+
                     line = raw_line.strip()
                     if not line.startswith("data: "):
                         continue
@@ -989,6 +1261,9 @@ class OllamaChat:
                     if fragment:
                         if first_token_time is None:
                             first_token_time = time.monotonic()
+                            if thinking_shown:
+                                print(f"\r{'':20}\r  ", end="", flush=True)
+                                thinking_shown = False
                         self._print_fragment(fragment)
                         content_parts.append(fragment)
                         token_count += 1
@@ -999,6 +1274,9 @@ class OllamaChat:
                         if idx not in tool_calls_accum:
                             if first_token_time is None:
                                 first_token_time = time.monotonic()
+                                if thinking_shown:
+                                    print(f"\r{'':20}\r  ", end="", flush=True)
+                                    thinking_shown = False
                             tool_calls_accum[idx] = {
                                 "id": tc.get("id", ""),
                                 "name": "",
@@ -1011,19 +1289,41 @@ class OllamaChat:
                             tool_calls_accum[idx]["arguments_parts"].append(func["arguments"])
 
         except httpx.TimeoutException:
-            print(f"\n  {C_RED}{DOT} vllm-mlx stream timed out after {OLLAMA_TIMEOUT}s{C_RESET}")
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
+            read_timeout = PLAN_READ_TIMEOUT if self._plan_mode else STREAM_READ_TIMEOUT
+            print(f"\n  {C_RED}{DOT} vllm-mlx stream timed out ({read_timeout:.0f}s between chunks){C_RESET}")
+            print(f"  {C_MUTED}{DIAMOND_SM} resetting connection{C_RESET}")
+            await self._reset_http()
             return None
         except httpx.HTTPStatusError as e:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"\n  {C_RED}{DOT} vllm-mlx HTTP {e.response.status_code}{C_RESET}")
             print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
         except httpx.ConnectError:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"  {C_RED}{DOT} Cannot connect to vllm-mlx at {VLLM_URL}{C_RESET}")
             return None
         except Exception as e:
+            if thinking_shown:
+                print(f"\r{'':20}\r", end="", flush=True)
             print(f"\n  {C_RED}{DOT} Stream failed: {e}{C_RESET}")
             print(f"  {C_MUTED}{DIAMOND_SM} falling back to non-streaming{C_RESET}")
             return await self._send_to_ollama()
+        finally:
+            # Always stop ESC watcher and restore terminal
+            cancel_event.set()
+            esc_task.cancel()
+            try:
+                await esc_task
+            except asyncio.CancelledError:
+                pass
+
+        if interrupted:
+            return None
 
         stream_end = time.monotonic()
 
@@ -1097,6 +1397,11 @@ class OllamaChat:
         messages.extend(history)
         return messages
 
+    def restore_messages(self, messages: list[dict]):
+        """Restore conversation history from a previous session."""
+        self._messages = list(messages)
+        self._plan_mode = False  # Always resume in normal mode
+
     def reset(self):
         """Clear conversation history."""
         self._messages.clear()
@@ -1130,7 +1435,7 @@ def _setup_readline():
     # Tab-complete slash commands
     commands = ["/clear", "/tools", "/stats", "/rate", "/override",
                 "/promote", "/knowledge", "/history", "/model",
-                "/sessions", "/help", "/quit", "/exit"]
+                "/sessions", "/resume", "/help", "/quit", "/exit"]
     def completer(text, state):
         options = [c for c in commands if c.startswith(text)]
         return options[state] if state < len(options) else None
@@ -1146,13 +1451,127 @@ def _save_readline():
         pass
 
 
+def _resume_session(chat: OllamaChat, session_logger: SessionLogger,
+                    backend: str, target_id: str) -> bool:
+    """Resume a specific session. Returns True on success."""
+    try:
+        restored_msgs, meta = SessionLogger.load_session(target_id)
+        if not restored_msgs:
+            print(f"  {C_MUTED}{DIAMOND_SM} Session {target_id} has no conversation to restore{C_RESET}")
+            return False
+
+        session_logger.switch_to_session(target_id)
+        session_logger.log("session_resume", "",
+                           resumed_from=target_id,
+                           original_messages=len(restored_msgs))
+        chat.restore_messages(restored_msgs)
+
+        user_count = sum(1 for m in restored_msgs if m["role"] == "user")
+        asst_count = sum(1 for m in restored_msgs if m["role"] == "assistant")
+        print(f"  {C_GREEN}{DOT}{C_RESET} Resumed session {C_WHITE}{target_id}{C_RESET}")
+        print(f"  {C_MUTED}{DIAMOND_SM} {user_count} user + {asst_count} assistant messages restored{C_RESET}")
+
+        # Show last user message as context reminder
+        for m in reversed(restored_msgs):
+            if m["role"] == "user":
+                display = m["content"]
+                # Strip timestamp prefix
+                if display.startswith("["):
+                    bracket_end = display.find("] ")
+                    if bracket_end != -1:
+                        display = display[bracket_end + 2:]
+                if len(display) > 70:
+                    display = display[:67] + "..."
+                print(f"  {C_MUTED}{DIAMOND_SM} last topic: {display}{C_RESET}")
+                break
+        return True
+    except FileNotFoundError:
+        print(f"  {C_RED}{DOT} Session {target_id} not found{C_RESET}")
+        return False
+    except Exception as e:
+        print(f"  {C_RED}{DOT} Resume failed: {e}{C_RESET}")
+        return False
+
+
+def _offer_session_resume(chat: OllamaChat, session_logger: SessionLogger,
+                          backend: str):
+    """Auto-detect interrupted sessions and offer to resume."""
+    sessions = SessionLogger.list_sessions(limit=5)
+    # Filter out current session
+    candidates = [s for s in sessions if s["id"] != session_logger.session_id]
+    if not candidates:
+        return
+
+    candidate_id = candidates[0]["id"]
+    candidate_file = SESSIONS_DIR / f"{candidate_id}.jsonl"
+    try:
+        # Check if session ended cleanly (has session_end marker)
+        last_line = ""
+        with open(candidate_file) as f:
+            for last_line in f:
+                pass
+        if not last_line.strip():
+            return
+        last_entry = json.loads(last_line.strip())
+        if last_entry.get("role") == "session_end":
+            return  # Clean exit, don't offer resume
+
+        if candidates[0]["messages"] < 3:
+            return  # Too short to be worth resuming
+
+        # Check recency (within 30 minutes)
+        ts_str = last_entry.get("ts", "")
+        try:
+            last_ts = datetime.fromisoformat(ts_str)
+            age_minutes = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+        except (ValueError, TypeError):
+            return
+
+        if age_minutes > 30:
+            return
+
+        preview = candidates[0].get("preview", "")[:50]
+        print(f"  {C_YELLOW}{DIAMOND_SM}{C_RESET} {C_MUTED}Interrupted session: "
+              f"{candidate_id} ({candidates[0]['messages']} msgs, "
+              f"{age_minutes:.0f}m ago){C_RESET}")
+        if preview:
+            print(f"  {C_MUTED}  \"{preview}\"{C_RESET}")
+
+        try:
+            answer = input(f"  {C_MUTED}  Resume? [Y/n]: {C_RESET}").strip().lower()
+            if answer in ("", "y", "yes"):
+                _resume_session(chat, session_logger, backend, candidate_id)
+        except (EOFError, KeyboardInterrupt):
+            pass
+    except Exception:
+        pass  # Silently skip on any error
+
+
+def _cli_resume(chat: OllamaChat, session_logger: SessionLogger,
+                backend: str, resume_id: str | None = None):
+    """Handle --resume CLI flag."""
+    if resume_id is None:
+        sessions = SessionLogger.list_sessions(limit=5)
+        candidates = [s for s in sessions if s["id"] != session_logger.session_id]
+        if not candidates:
+            print(f"  {C_MUTED}{DIAMOND_SM} No previous sessions to resume{C_RESET}")
+            return
+        resume_id = candidates[0]["id"]
+
+    _resume_session(chat, session_logger, backend, resume_id)
+
+
 async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                            session_logger: SessionLogger,
-                           backend_version: str = "", backend: str = "ollama"):
-    """Run the interactive input loop."""
+                           backend_version: str = "", backend: str = "ollama") -> str:
+    """Run the interactive input loop. Returns exit reason."""
     _setup_readline()
     print_banner(tool_manager, backend_version, backend)
 
+    # Auto-detect interrupted session
+    _offer_session_resume(chat, session_logger, backend)
+
+    exit_reason = "quit"
     while True:
         try:
             mode_hint = f" \x01{C_YELLOW}\x02[plan]\x01{C_RESET}\x02" if chat._plan_mode else ""
@@ -1160,8 +1579,13 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
             user_input = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: input(prompt_str)
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
+            exit_reason = "eof"
+            break
+        except KeyboardInterrupt:
+            print()
+            exit_reason = "interrupt"
             break
 
         user_input = user_input.strip()
@@ -1183,8 +1607,8 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 else:
                     chat._plan_mode = True
                     chat.reset()
-                    print(f"  {C_YELLOW}{C_BOLD}{DIAMOND} Plan mode{C_RESET} {C_MUTED}— thinking enabled, tools disabled{C_RESET}")
-                    print(f"  {C_MUTED}{DIAMOND_SM} discuss your approach, then /build to execute{C_RESET}")
+                    print(f"  {C_YELLOW}{C_BOLD}{DIAMOND} Plan mode{C_RESET} {C_MUTED}— thinking enabled, research tools only{C_RESET}")
+                    print(f"  {C_MUTED}{DIAMOND_SM} web_search + knowledge available · /build to execute{C_RESET}")
                 continue
             elif cmd == "/build":
                 if not chat._plan_mode:
@@ -1314,7 +1738,22 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 else:
                     for s in sessions:
                         size_kb = s["size"] / 1024
-                        print(f"  {C_MUTED}{s['id']}{C_RESET}  {C_WHITE}{s['messages']} msgs{C_RESET}  {C_MUTED}{size_kb:.1f}KB{C_RESET}  {C_MUTED}{s['preview']}{C_RESET}")
+                        active = f" {C_GREEN}◀{C_RESET}" if s["id"] == session_logger.session_id else ""
+                        print(f"  {C_MUTED}{s['id']}{C_RESET}  {C_WHITE}{s['messages']} msgs{C_RESET}  {C_MUTED}{size_kb:.1f}KB{C_RESET}  {C_MUTED}{s['preview']}{C_RESET}{active}")
+                continue
+            elif cmd.startswith("/resume"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    target_id = parts[1].strip()
+                else:
+                    sessions = SessionLogger.list_sessions(limit=5)
+                    candidates = [s for s in sessions
+                                  if s["id"] != session_logger.session_id]
+                    if not candidates:
+                        print(f"  {C_MUTED}{DIAMOND_SM} No previous sessions to resume{C_RESET}")
+                        continue
+                    target_id = candidates[0]["id"]
+                _resume_session(chat, session_logger, backend, target_id)
                 continue
             elif cmd == "/help":
                 print(f"  {C_BOLD}{C_WHITE}Chat{C_RESET}")
@@ -1324,7 +1763,7 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 print(f"  {C_WHITE}/knowledge{C_RESET}  {C_MUTED}─ Query knowledge base{C_RESET}")
                 print()
                 print(f"  {C_BOLD}{C_WHITE}Modes{C_RESET}")
-                print(f"  {C_WHITE}/plan{C_RESET}       {C_MUTED}─ Plan mode (thinking on, tools off){C_RESET}")
+                print(f"  {C_WHITE}/plan{C_RESET}       {C_MUTED}─ Plan mode (thinking on, research tools only){C_RESET}")
                 print(f"  {C_WHITE}/build{C_RESET}      {C_MUTED}─ Build mode (tools on, execute plan){C_RESET}")
                 print()
                 print(f"  {C_BOLD}{C_WHITE}Proving Ground{C_RESET}")
@@ -1334,6 +1773,7 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
                 print(f"  {C_WHITE}/override{C_RESET}   {C_MUTED}─ Mark last task as corrected{C_RESET}")
                 print(f"  {C_WHITE}/promote{C_RESET}    {C_MUTED}─ Approve tier promotion{C_RESET}")
                 print(f"  {C_WHITE}/sessions{C_RESET}   {C_MUTED}─ List saved sessions{C_RESET}")
+                print(f"  {C_WHITE}/resume [ID]{C_RESET} {C_MUTED}─ Resume a previous session{C_RESET}")
                 print()
                 print(f"  {C_WHITE}/quit{C_RESET}       {C_MUTED}─ Exit{C_RESET}")
                 continue
@@ -1354,6 +1794,8 @@ async def interactive_loop(chat: OllamaChat, tool_manager: MCPToolManager,
         except asyncio.CancelledError:
             print(f"\n  {C_MUTED}{DIAMOND_SM} cancelled{C_RESET}\n")
             continue
+
+    return exit_reason
 
 
 async def one_shot(chat: OllamaChat, prompt: str):
@@ -1431,6 +1873,7 @@ async def main():
     session_logger = SessionLogger()
     chat = None
     backend_version = ""
+    exit_reason = "quit"
 
     # Initialize Proving Ground tracker
     tracker.init_db()
@@ -1457,18 +1900,27 @@ async def main():
         # Create chat client
         chat = OllamaChat(tool_manager, session_logger, backend=backend)
 
-        if len(sys.argv) > 1:
+        if len(sys.argv) > 1 and sys.argv[1] != "--resume":
             # One-shot mode: join all args as prompt
             prompt = " ".join(sys.argv[1:])
             await one_shot(chat, prompt)
         else:
+            # Handle --resume flag
+            if len(sys.argv) > 1 and sys.argv[1] == "--resume":
+                resume_id = sys.argv[2] if len(sys.argv) > 2 else None
+                _cli_resume(chat, session_logger, backend, resume_id)
+
             # Interactive mode
-            await interactive_loop(chat, tool_manager, session_logger,
-                                   backend_version, backend)
+            exit_reason = await interactive_loop(chat, tool_manager, session_logger,
+                                                 backend_version, backend)
 
     except KeyboardInterrupt:
-        pass
+        exit_reason = "interrupt"
     finally:
+        # Log session end for resume detection
+        session_logger.log("session_end", "",
+                           reason=exit_reason,
+                           message_count=session_logger.message_count)
         # Auto-demotion check at session end
         demotion = tracker.check_demotion()
         if demotion:
